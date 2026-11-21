@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 
 
 MAX_DOWNTIME_MIN = 365 * 24 * 60
+MAX_EVENT_TYPE_LENGTH = 120
 
 
 class FailureType(str, Enum):
@@ -29,6 +30,14 @@ FAILURE_LABELS = {
     "material": "Сырьё/материал",
     "other": "Прочее",
 }
+
+
+def event_type_label(failure_type: str, custom_event_type: str | None = None) -> str:
+    return custom_event_type or FAILURE_LABELS.get(failure_type, failure_type)
+
+
+def custom_type_key(failure_type: str, custom_event_type: str | None) -> str:
+    return " ".join(custom_event_type.casefold().split()) if failure_type == "other" and custom_event_type else ""
 
 
 class Part(BaseModel):

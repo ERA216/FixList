@@ -2,7 +2,7 @@
 import json
 import sqlite3
 import threading
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from typing import Optional
 
@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS shift_logs (
     created_at TEXT NOT NULL,
     raw_text TEXT NOT NULL,
     author_role TEXT DEFAULT 'Мастер смены',
+    author_user_id INTEGER,
     status TEXT NOT NULL DEFAULT 'processed',   -- processed | pending (ИИ был недоступен)
     mode TEXT,                                  -- ai | rules
     is_demo INTEGER NOT NULL DEFAULT 0
@@ -27,6 +28,7 @@ CREATE TABLE IF NOT EXISTS incidents (
     occurred_at TEXT NOT NULL,
     equipment_id TEXT NOT NULL REFERENCES equipment(id),
     failure_type TEXT NOT NULL,
+    custom_event_type TEXT,
     downtime_min INTEGER NOT NULL,
     parts_cost_kzt INTEGER NOT NULL DEFAULT 0,
     parts_json TEXT DEFAULT '[]',
@@ -102,6 +104,12 @@ INCIDENT_STATUS_COLUMNS = {"status": "TEXT NOT NULL DEFAULT 'new'", "assignee": 
 # путь заявки: сотрудник сообщил → администратор одобрил → сотрудники решают с ИИ → (нужна помощь → администратор) → решена
 STATUS_LABELS = {"new": "Ждёт одобрения", "approved": "Решают сотрудники", "escalated": "Нужна помощь администратора", "resolved": "Решена"}
 STATUS_LABELS["archived"] = "Архивное событие"
+TICKET_TRANSITIONS = {
+    "new": {"archived", "resolved"},
+    "approved": {"new"},
+    "escalated": {"approved"},
+    "resolved": {"new", "approved", "escalated"},
+}
 USERS_REBUILD = """
 ALTER TABLE users RENAME TO users_old;
 CREATE TABLE users (
@@ -159,10 +167,13 @@ def init_db(path=None) -> None:
             cols = [r[1] for r in c.execute(f"PRAGMA table_info({t})")]
             if "company_id" not in cols:
                 c.execute(f"ALTER TABLE {t} ADD COLUMN company_id INTEGER NOT NULL DEFAULT 1")
+        if "author_user_id" not in {row[1] for row in c.execute("PRAGMA table_info(shift_logs)")}:
+            c.execute("ALTER TABLE shift_logs ADD COLUMN author_user_id INTEGER")
         inc_cols = [r[1] for r in c.execute("PRAGMA table_info(incidents)")]
-        source_columns = {"source_id": "TEXT", "source_dataset": "TEXT", "source_record_json": "TEXT",
-                          "downtime_seconds": "INTEGER", "parts_cost_known": "INTEGER NOT NULL DEFAULT 1"}
-        for col, ddl in source_columns.items():
+        detail_columns = {"source_id": "TEXT", "source_dataset": "TEXT", "source_record_json": "TEXT",
+                          "downtime_seconds": "INTEGER", "parts_cost_known": "INTEGER NOT NULL DEFAULT 1",
+                          "custom_event_type": "TEXT"}
+        for col, ddl in detail_columns.items():
             if col not in inc_cols:
                 c.execute(f"ALTER TABLE incidents ADD COLUMN {col} {ddl}")
         eq_cols = [r[1] for r in c.execute("PRAGMA table_info(equipment)")]
@@ -222,13 +233,19 @@ def is_empty(path=None) -> bool:
         return c.execute("SELECT COUNT(*) FROM companies").fetchone()[0] == 0
 
 
-def add_shift_log(raw_text: str, status: str, mode: str, created_at: Optional[str] = None, is_demo: bool = False, conn=None, author: Optional[str] = None, *, company_id: Optional[int] = None) -> int:
-    sql = "INSERT INTO shift_logs(created_at, raw_text, status, mode, is_demo, author_role, company_id) VALUES (?,?,?,?,?,?,?)"
-    args = (created_at or now_iso(), raw_text, status, mode, int(is_demo), author or "Мастер смены", company_id or current_company())
-    if conn is not None:
-        return conn.execute(sql, args).lastrowid
-    with connect() as c:
-        return c.execute(sql, args).lastrowid
+def add_shift_log(raw_text: str, status: str, mode: str, created_at: Optional[str] = None, is_demo: bool = False, conn=None,
+                  author: Optional[str] = None, *, company_id: Optional[int] = None, author_user_id: Optional[int] = None) -> int:
+    sql = """INSERT INTO shift_logs(created_at,raw_text,status,mode,is_demo,author_role,company_id,author_user_id)
+             VALUES (?,?,?,?,?,?,?,?)"""
+    company = company_id or current_company()
+    with (connect() if conn is None else nullcontext(conn)) as c:
+        if author_user_id is not None:
+            user = c.execute("SELECT display_name FROM users WHERE id=? AND company_id=?", (author_user_id, company)).fetchone()
+            if not user:
+                raise ValueError("Автор записи не найден в текущем кабинете.")
+            author = user["display_name"]
+        return c.execute(sql, (created_at or now_iso(), raw_text, status, mode, int(is_demo),
+                               author or "Мастер смены", company, author_user_id)).lastrowid
 
 
 def add_incident(log_id: int, inc: dict, occurred_at: Optional[str] = None, is_demo: bool = False, conn=None, *, company_id: Optional[int] = None) -> int:
@@ -236,10 +253,11 @@ def add_incident(log_id: int, inc: dict, occurred_at: Optional[str] = None, is_d
     parts_cost = inc.get("parts_cost_kzt")
     if parts_cost is None:
         parts_cost = sum(part_price(p.get("name", "")) * int(p.get("qty", 1)) for p in parts)
-    sql = """INSERT INTO incidents(log_id, occurred_at, equipment_id, failure_type, downtime_min, parts_cost_kzt,
-             parts_json, cause, action, confidence, needs_review, is_demo, company_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"""
+    sql = """INSERT INTO incidents(log_id, occurred_at, equipment_id, failure_type, custom_event_type, downtime_min,
+             parts_cost_kzt, parts_json, cause, action, confidence, needs_review, is_demo, company_id)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
     company = company_id or current_company()
-    args = (log_id, occurred_at or now_iso(), inc["equipment_id"], inc["failure_type"], int(inc["downtime_min"]),
+    args = (log_id, occurred_at or now_iso(), inc["equipment_id"], inc["failure_type"], inc.get("custom_event_type"), int(inc["downtime_min"]),
             int(parts_cost), json.dumps(parts, ensure_ascii=False), inc.get("cause"), inc.get("action"),
             inc.get("confidence"), int(bool(inc.get("needs_review"))), int(is_demo), company)
     unknown_cost = not is_demo and inc.get("parts_cost_kzt") is None and bool(source_profile(company))
@@ -255,8 +273,8 @@ def add_incident(log_id: int, inc: dict, occurred_at: Optional[str] = None, is_d
         return incident_id
 
 
-def incidents(equipment_id: Optional[str] = None, *, incident_id: Optional[int] = None) -> list[dict]:
-    q = """SELECT i.*, s.raw_text, s.author_role, e.name AS equipment_name, e.hour_cost_kzt, e.hour_cost_known
+def incidents(equipment_id: Optional[str] = None, *, incident_id: Optional[int] = None, author_user_id: Optional[int] = None) -> list[dict]:
+    q = """SELECT i.*, s.raw_text, s.author_role, s.mode AS log_mode, e.name AS equipment_name, e.hour_cost_kzt, e.hour_cost_known
            FROM incidents i JOIN shift_logs s ON s.id = i.log_id JOIN equipment e ON e.id = i.equipment_id
            WHERE i.company_id = ?"""
     args: tuple = (current_company(),)
@@ -268,6 +286,13 @@ def incidents(equipment_id: Optional[str] = None, *, incident_id: Optional[int] 
     if incident_id is not None:
         q += " AND i.id = ?"
         args += (incident_id,)
+    if author_user_id is not None:
+        # Match older logs by name only when the author can be identified unambiguously.
+        q += """ AND EXISTS (SELECT 1 FROM users u WHERE u.id=? AND u.company_id=i.company_id
+                  AND (s.author_user_id=u.id OR (s.author_user_id IS NULL AND s.author_role=u.display_name
+                  AND (SELECT COUNT(*) FROM users peer WHERE peer.company_id=u.company_id
+                       AND peer.display_name=u.display_name)=1)))"""
+        args += (author_user_id,)
     with connect() as c:
         rows = [dict(r) for r in c.execute(q + " ORDER BY i.occurred_at", args)]
     for r in rows:
@@ -339,22 +364,29 @@ def set_meta(key: str, value: str) -> None:
 
 
 def set_status(incident_id: int, status: str, who: Optional[str] = None, resolution: Optional[str] = None,
-               cause: Optional[str] = None, note: Optional[str] = None) -> None:
-    if status not in STATUS_LABELS:
+               cause: Optional[str] = None, note: Optional[str] = None, *, expected_status=None) -> None:
+    if status not in TICKET_TRANSITIONS:
         raise ValueError("Неизвестный статус")
+    target = (incident_id, current_company())
     with connect() as c:
-        row = c.execute("SELECT id FROM incidents WHERE id=? AND company_id=?", (incident_id, current_company())).fetchone()
+        c.execute("BEGIN IMMEDIATE")
+        row = c.execute("SELECT status FROM incidents WHERE id=? AND company_id=?", target).fetchone()
         if not row:
             raise ValueError("Заявка не найдена")
+        current = row["status"]
+        if current not in TICKET_TRANSITIONS[status] or (expected_status is not None and current != expected_status):
+            label = STATUS_LABELS.get(current, current or "неизвестен")
+            raise ValueError(f"Действие недоступно для текущего статуса «{label}». Откройте карточку заново.")
         if status == "approved":
-            c.execute("UPDATE incidents SET status='approved', approved_by=?, taken_at=? WHERE id=?", (who, now_iso(), incident_id))
+            c.execute("UPDATE incidents SET status='approved', approved_by=?, taken_at=? WHERE id=? AND company_id=?", (who, now_iso(), *target))
         elif status == "escalated":
-            c.execute("UPDATE incidents SET status='escalated', escalation_note=?, assignee=? WHERE id=?", (note, who, incident_id))
+            c.execute("UPDATE incidents SET status='escalated', escalation_note=?, assignee=? WHERE id=? AND company_id=?", (note, who, *target))
         elif status == "resolved":
-            c.execute("UPDATE incidents SET status='resolved', resolved_at=?, resolution=?, cause=COALESCE(?, cause), assignee=? WHERE id=?",
-                      (now_iso(), resolution, cause, who, incident_id))
+            c.execute("""UPDATE incidents SET status='resolved', resolved_at=?, resolution=?, cause=COALESCE(?, cause), assignee=?
+                         WHERE id=? AND company_id=?""", (now_iso(), resolution, cause, who, *target))
         else:
-            c.execute("UPDATE incidents SET status='new', approved_by=NULL, escalation_note=NULL, resolved_at=NULL WHERE id=?", (incident_id,))
+            c.execute("""UPDATE incidents SET status='new', approved_by=NULL, escalation_note=NULL,
+                         resolved_at=NULL, taken_at=NULL, assignee=NULL WHERE id=? AND company_id=?""", target)
 
 
 def log_llm_call(purpose: str, provider: str, model: str, latency_ms: int, ok: bool, attempts: int, error: Optional[str]) -> None:

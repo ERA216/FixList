@@ -7,8 +7,8 @@ from typing import Optional
 
 import pandas as pd
 
-from . import config, db
-from .schemas import FAILURE_LABELS, kzt, loss_label, num
+from . import config, db, finance
+from .schemas import custom_type_key, event_type_label, kzt, loss_label, num
 
 
 def estimate_loss(downtime_min, hourly_rate, parts_cost):
@@ -22,20 +22,30 @@ def sum_losses(values):
     return None if any(pd.isna(value) for value in values) else round(sum(values))
 
 
-def incidents_df(equipment_id: Optional[str] = None) -> pd.DataFrame:
-    rows = db.incidents(equipment_id)
+def downtime_and_loss(rows):
+    totals = finance.for_events(rows, hourly_rate=0)
+    costs = [row["parts_cost_kzt"] for row in rows]
+    parts = int(sum(cost for cost in costs if not pd.isna(cost)))
+    loss = None if totals["unrated_hours"] or any(pd.isna(cost) for cost in costs) else round(totals["rated_cost_kzt"] + parts)
+    return totals["hours"], parts, loss
+
+
+def incidents_df(equipment_id: Optional[str] = None, *, as_of: Optional[datetime] = None) -> pd.DataFrame:
+    cutoff = (as_of or datetime.now()).date().isoformat()
+    rows = [row for row in db.incidents(equipment_id) if row["occurred_at"][:10] <= cutoff]
     df = pd.DataFrame(rows)
     if df.empty:
         return df
     df["occurred_at"] = pd.to_datetime(df["occurred_at"])
+    df["custom_type_key"] = [custom_type_key(row["failure_type"], row["custom_event_type"]) for row in rows]
     df["downtime_h"] = df["downtime_min"] / 60
     df["loss_kzt"] = [estimate_loss(row["downtime_min"], row["hour_cost_kzt"], row["parts_cost_kzt"]) for row in rows]
     return df
 
 
 def _window(df: pd.DataFrame, as_of: Optional[datetime], days: int) -> pd.DataFrame:
-    as_of = as_of or datetime.now()
-    return df[(df["occurred_at"] > as_of - timedelta(days=days)) & (df["occurred_at"] <= as_of + timedelta(days=1))]
+    day = (as_of or datetime.now()).replace(hour=0, minute=0, second=0, microsecond=0)
+    return df[(df["occurred_at"] >= day - timedelta(days=days - 1)) & (df["occurred_at"] < day + timedelta(days=1))]
 
 
 def intervals_days(dates: pd.Series) -> list[int]:
@@ -43,21 +53,26 @@ def intervals_days(dates: pd.Series) -> list[int]:
     return [int((b - a).days) for a, b in zip(d, d[1:])]
 
 
-def group_stats(equipment_id: str, failure_type: str, as_of: Optional[datetime] = None, days: Optional[int] = None) -> dict:
+def group_stats(equipment_id: str, failure_type: str, as_of: Optional[datetime] = None, days: Optional[int] = None,
+                *, custom_event_type=None) -> dict:
     """Статистика пары станок × тип поломки. Это база для плана экономии."""
     days = days or config.ANALYSIS_WINDOW_DAYS
-    df = incidents_df(equipment_id)
+    df = incidents_df(equipment_id, as_of=as_of)
     if df.empty:
         return {"failures": 0}
-    full = df[df["failure_type"] == failure_type]
+    key = custom_type_key(failure_type, custom_event_type)
+    full = df[(df["failure_type"] == failure_type) & (df["custom_type_key"] == key)]
+    return _group_stats(full, equipment_id, failure_type, as_of, days)
+
+
+def _group_stats(full, equipment_id, failure_type, as_of, days):
     win = _window(full, as_of, days)
     if win.empty:
         return {"failures": 0, "equipment_id": equipment_id, "failure_type": failure_type}
     rate = win["hour_cost_kzt"].iloc[0]
     hour_cost = int(rate) if pd.notna(rate) and rate > 0 else None
-    downtime_h = float(win["downtime_h"].sum())
-    parts = int(win["parts_cost_kzt"].sum())
-    loss = sum_losses(win["loss_kzt"])
+    downtime_h, parts, loss = downtime_and_loss(win.to_dict("records"))
+    custom = win["custom_event_type"].iloc[-1]
     if loss is None:
         formula = "Для полной оценки нужны тариф простоя и стоимость запчастей."
         if parts:
@@ -70,7 +85,8 @@ def group_stats(equipment_id: str, failure_type: str, as_of: Optional[datetime] 
         "equipment_id": equipment_id,
         "equipment_name": win["equipment_name"].iloc[0],
         "failure_type": failure_type,
-        "failure_label": FAILURE_LABELS.get(failure_type, failure_type),
+        "failure_label": event_type_label(failure_type, custom),
+        "custom_event_type": custom,
         "window_days": days,
         "failures": int(len(win)),
         "downtime_h": round(downtime_h, 2),
@@ -86,19 +102,20 @@ def group_stats(equipment_id: str, failure_type: str, as_of: Optional[datetime] 
 
 def equipment_summary(as_of: Optional[datetime] = None, days: Optional[int] = None) -> list[dict]:
     days = days or config.ANALYSIS_WINDOW_DAYS
-    df = incidents_df()
+    df = incidents_df(as_of=as_of)
     if df.empty:
         return []
     win = _window(df, as_of, days)
     out = []
     for eq_id, g in win.groupby("equipment_id"):
+        hours, parts, loss = downtime_and_loss(g.to_dict("records"))
         out.append({
             "equipment_id": eq_id,
             "equipment_name": g["equipment_name"].iloc[0],
             "failures": int(len(g)),
-            "downtime_h": round(float(g["downtime_h"].sum()), 2),
-            "loss_kzt": sum_losses(g["loss_kzt"]),
-            "parts_kzt": int(g["parts_cost_kzt"].sum()),
+            "downtime_h": round(hours, 2),
+            "loss_kzt": loss,
+            "parts_kzt": parts,
         })
     return sorted(out, key=lambda r: (r["loss_kzt"] is None, -(r["loss_kzt"] or 0)))
 
@@ -106,12 +123,12 @@ def equipment_summary(as_of: Optional[datetime] = None, days: Optional[int] = No
 def anomalies(as_of: Optional[datetime] = None, days: Optional[int] = None) -> list[dict]:
     """Правила: повторяемость, сокращение интервалов, всплеск простоя. Каждый сигнал — со ссылками на записи."""
     days = days or config.ANALYSIS_WINDOW_DAYS
-    df = incidents_df()
+    df = incidents_df(as_of=as_of)
     if df.empty:
         return []
     signals = []
-    for (eq_id, ftype), full in df.groupby(["equipment_id", "failure_type"]):
-        st = group_stats(eq_id, ftype, as_of, days)
+    for (eq_id, ftype, _), full in df.groupby(["equipment_id", "failure_type", "custom_type_key"]):
+        st = _group_stats(full, eq_id, ftype, as_of, days)
         if not st.get("failures"):
             continue
         reasons = []
@@ -181,18 +198,17 @@ def equipment_health(today: Optional[datetime] = None) -> list[dict]:
     """
     today = (today or datetime.now()).replace(hour=0, minute=0, second=0, microsecond=0)
     days = config.ANALYSIS_WINDOW_DAYS
-    df = incidents_df()
+    df = incidents_df(as_of=today)
     last_insp = {}
     for r in db.inspections():
         last_insp.setdefault(r["equipment_id"], r)
     out = []
     for e in db.load_equipment():
         g = df[df["equipment_id"] == e["id"]] if not df.empty else df
-        win = _window(g, today + timedelta(hours=23, minutes=59), days) if not g.empty else g
+        win = _window(g, today, days) if not g.empty else g
         failures = int(len(win))
-        downtime_h = round(float(win["downtime_h"].sum()), 1) if failures else 0.0
-        loss = sum_losses(win["loss_kzt"]) if failures else 0
-        parts = int(win["parts_cost_kzt"].sum()) if failures else 0
+        hours, parts, loss = downtime_and_loss(win.to_dict("records"))
+        downtime_h = round(hours, 1)
         iv = intervals_days(g["occurred_at"]) if len(g) >= 2 else []
         recent = [x for x in iv[-3:] if x > 0]
         last_date = g["occurred_at"].max().normalize() if not g.empty else None

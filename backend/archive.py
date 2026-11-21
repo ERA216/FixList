@@ -1,9 +1,7 @@
 """Install real source events into the primary workspace and query that workspace."""
-from collections import Counter
 from contextlib import closing
 from datetime import date, datetime
 import json
-import re
 import sqlite3
 
 from . import config, db, open_data
@@ -90,45 +88,3 @@ def dashboard() -> dict:
             "anomalies": [{"equipment_id": row["equipment_id"], "failure_type": "kelmarsh:" + row["code"], "failure_label": row["label"],
                            "equipment_name": f'Kelmarsh {int(row["equipment_id"][-2:])}', "severity": "medium", "loss_kzt": None,
                            "title": f'Kelmarsh {int(row["equipment_id"][-2:])} · {row["label"]}', "count": row["count"]} for row in view["signals"]]}
-
-
-def ask(question: str, history=None) -> dict:
-    question = (question or "").strip()
-    if not question:
-        raise ValueError("Напишите вопрос.")
-    q = question.casefold()
-    match = re.search(r"(?:kelmarsh|турбин[аы]?)\s*(?:№|#)?\s*([1-6])\b", q)
-    equipment_id = f"KEL{int(match[1]):02d}" if match else None
-    view = report(equipment_id)
-    stats, signals = view["stats"], view["signals"]
-    names = [f'Kelmarsh {int(equipment_id[-2:])}'] if equipment_id else [row["name"] for row in equipment()]
-    facts = {"period": "2016-01-01 — 2016-12-31 UTC", "equipment": names, "event_records": stats["events"],
-             "stop_periods": stats["episodes"], "turbine_hours": round(stats["downtime_seconds"] / 3600, 2),
-             "repeated_codes": [{"equipment": f'Kelmarsh {int(row["equipment_id"][-2:])}', "code": row["code"], "message": row["label"], "records": row["count"]} for row in signals[:5]],
-             "repair_cost": None, "parts_cost": None, "confirmed_cause": None, "future_failure_date": None}
-    if any(word in q for word in ("цен", "стоим", "убыт", "дороже", "эконом", "потер")):
-        text = "В источнике нет тарифов простоя и стоимости ремонта. В разделе «Деньги и экономия» можно рассчитать сценарий по введённому вами тарифу."
-    elif any(word in q for word in ("когда слом", "сломается", "прогноз", "здоров")):
-        text = "Архив содержит реальные остановки 2016 года. Подтверждённых данных о текущем состоянии, будущем отказе и результате ремонта в нём нет. Можно изучить повторения сигнала на конкретной турбине."
-    else:
-        text = f'{", ".join(names) if equipment_id else "Ветропарк Kelmarsh"}: за 2016 год в базе {stats["events"]} записей об остановках; суммарно {facts["turbine_hours"]:g} агрегато-часов.'
-        if signals:
-            top = signals[0]
-            text += f' Чаще всего повторяется сигнал «{top["label"]}» на Kelmarsh {int(top["equipment_id"][-2:])}: {top["count"]} записей, код {top["code"]}. Это основание изучить историю сигнала; причина поломки в источнике не установлена.'
-    # Missing values are answered deterministically rather than guessed by a model.
-    if any(word in q for word in ("цен", "стоим", "убыт", "дороже", "эконом", "потер", "сломается", "прогноз", "здоров")):
-        return {"answer": text, "based_on": names, "mode": "rules", "warning": None}
-    from . import llm
-    from .assistant import Answer
-    from .advisor import _numbers
-    try:
-        output = llm.call_json(
-            "Ты аналитик FixList. Ответь кратко по-русски только по переданным фактам реального архива Kelmarsh за 2016 год. "
-            "Это архив, не текущие аварии. Нет сведений о причине, стоимости, выполненном ремонте или следующей поломке. "
-            "Не добавляй неизвестные факты и числа. Верни JSON {answer, based_on}.",
-            json.dumps({"facts": facts, "question": question}, ensure_ascii=False), Answer, "archive_assistant")
-        if _numbers(output.answer) - _numbers(json.dumps(facts, ensure_ascii=False)):
-            raise llm.LLMBadOutput("unsupported numbers")
-        return {"answer": output.answer, "based_on": names, "mode": "ai", "warning": None}
-    except llm.LLMError:
-        return {"answer": text, "based_on": names, "mode": "rules", "warning": None}

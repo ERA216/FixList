@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from backend import archive, config, db, open_data, service
+from backend.schemas import kzt
 
 
 class PrimaryArchiveTests(unittest.TestCase):
@@ -126,10 +127,22 @@ class PrimaryArchiveTests(unittest.TestCase):
             self.assertFalse(any(button.label == "09   Реальные данные" for button in app.button))
         app.session_state["page"] = "План экономии"
         app.run()
+        hours = service.archive_report()["stats"]["downtime_seconds"] / 3600
+        self.assertTrue(any(f"≈ {kzt(hours * 50_000)} ₸" in item.value for item in app.markdown))
         app.number_input(key="archive-hour-rate").set_value(10000).run()
         self.assertFalse(app.exception)
         app.number_input(key="archive-reduction").set_value(10).run()
         app.number_input(key="archive-investment").set_value(50000).run()
+        self.assertFalse(app.exception)
+        self.assertTrue(any(f"≈ {kzt(hours * 1000)} ₸" in item.value for item in app.markdown))
+        self.assertTrue(any("Расчётная окупаемость" in item.value for item in app.markdown))
+        app.button(key="nav_Спросить ИИ").click().run()
+        app.chat_input[0].set_value("насколько убытков я ушел").run()
+        self.assertTrue(any(f"≈ {kzt(hours * 1000)} ₸" in item.value for item in app.markdown))
+        app.button(key="chat-money").click().run()
+        self.assertEqual(app.session_state["page"], "План экономии")
+        self.assertEqual(app.number_input(key="archive-hour-rate").value, 10000)
+        self.assertEqual(app.number_input(key="archive-reduction").value, 10)
         self.assertFalse(app.exception)
 
 

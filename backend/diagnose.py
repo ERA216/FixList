@@ -3,11 +3,12 @@
 ИИ выбирает и объясняет гипотезы, но только из базы. Без ИИ работает ранжирование по правилам.
 Гипотеза — не факт: в интерфейсе её подтверждает мастер, и у каждой есть список «что проверить».
 """
+from datetime import date
 import json
 from functools import lru_cache
 
 from . import analytics, config, db, llm
-from .schemas import FAILURE_LABELS, BaseModel, Field
+from .schemas import FAILURE_LABELS, BaseModel, Field, custom_type_key
 
 DIAG_PROMPT = """Ты инженер по надёжности на небольшом производстве. Помоги мастеру найти вероятную причину поломки.
 Тебе дают: отчёт мастера, историю этого станка с той же поломкой и список ДОПУСТИМЫХ причин с признаками.
@@ -44,9 +45,12 @@ def _norm(s: str) -> str:
     return (s or "").lower().replace("ё", "е")
 
 
-def history(equipment_id: str, failure_type: str) -> dict:
-    st = analytics.group_stats(equipment_id, failure_type)
-    rows = [r for r in db.incidents(equipment_id) if r["failure_type"] == failure_type]
+def history(equipment_id: str, failure_type: str, *, custom_event_type=None) -> dict:
+    st = analytics.group_stats(equipment_id, failure_type, custom_event_type=custom_event_type)
+    key = custom_type_key(failure_type, custom_event_type)
+    today = date.today().isoformat()
+    rows = [r for r in db.incidents(equipment_id) if r["failure_type"] == failure_type and r["occurred_at"][:10] <= today
+            and custom_type_key(failure_type, r["custom_event_type"]) == key]
     iv = st.get("intervals_days", []) if st.get("failures") else []
     return {
         "failures_in_window": st.get("failures", 0),

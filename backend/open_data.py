@@ -105,16 +105,17 @@ def merged_intervals(rows: list[dict], start: date | None = None, end: date | No
             lo, hi = max(lo, bounds[0]), min(hi, bounds[1])
         if lo < hi:
             grouped[row["equipment_id"]].append((lo, hi))
-    result = {}
-    for equipment_id, spans in grouped.items():
-        merged = []
-        for lo, hi in sorted(spans):
-            if merged and lo <= merged[-1][1]:
-                merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
-            else:
-                merged.append((lo, hi))
-        result[equipment_id] = merged
-    return result
+    return {equipment_id: merge_spans(spans) for equipment_id, spans in grouped.items()}
+
+
+def merge_spans(spans):
+    merged = []
+    for lo, hi in sorted(spans):
+        if merged and lo <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+        else:
+            merged.append((lo, hi))
+    return merged
 
 
 def seconds_in(spans) -> float:

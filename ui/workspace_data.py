@@ -4,7 +4,7 @@ from datetime import date, datetime
 import streamlit as st
 
 from backend import service
-from backend.schemas import MAX_DOWNTIME_MIN
+from backend.schemas import MAX_DOWNTIME_MIN, MAX_EVENT_TYPE_LENGTH, FailureType
 from ui import data_import
 
 
@@ -40,11 +40,10 @@ def _add_equipment(user):
         submitted = st.form_submit_button("Сохранить оборудование", use_container_width=True)
     if submitted:
         try:
-            equipment_id = service.add_workspace_equipment(user["id"], *fields)
+            service.add_workspace_equipment(user["id"], *fields)
         except ValueError as error:
             st.error(str(error))
         else:
-            st.session_state["event-equipment"] = equipment_id
             st.session_state["equipment-form-revision"] = revision + 1
             st.session_state["workspace-message"] = f"Оборудование «{fields[0].strip()}» добавлено. Можно записать событие."
             st.rerun()
@@ -52,25 +51,31 @@ def _add_equipment(user):
 
 def _add_event(user, equipment, open_event):
     st.subheader("Записать событие")
-    if selected := st.session_state.pop("next-event-equipment", None):
-        st.session_state["event-equipment"] = selected
     labels = {item["id"]: f"{item['name']} · {item['code']}" for item in equipment}
     failures = {None: "Определить по описанию", **service.failure_options()}
     revision = st.session_state.get("event-form-revision", 0)
-    with st.form(f"workspace-event-{revision}"):
+    form_key = f"workspace-event-{revision}"
+    with st.container(border=True, key=form_key):
         selected = st.selectbox("Оборудование", list(labels), index=None, format_func=lambda value: labels.get(value, value),
-                                placeholder="Выберите или напишите название", accept_new_options=True, key="event-equipment")
+                                placeholder="Выберите или напишите название", accept_new_options=True, key=f"{form_key}-equipment")
         st.caption("Чтобы добавить новое оборудование, напишите название и нажмите Enter.")
-        description = st.text_area("Что произошло?", placeholder="Например, насос остановился после падения давления", max_chars=4000)
+        description = st.text_area("Что произошло?", placeholder="Например, насос остановился после падения давления",
+                                   max_chars=4000, key=f"{form_key}-description")
         left, right = st.columns(2)
-        failure_type = left.selectbox("Тип события", list(failures), format_func=failures.get)
-        downtime = right.number_input("Простой, мин", min_value=0, max_value=MAX_DOWNTIME_MIN, step=1)
+        failure_type = left.selectbox("Тип события", list(failures), format_func=failures.get, key=f"{form_key}-type")
+        downtime = right.number_input("Простой, мин", min_value=0, max_value=MAX_DOWNTIME_MIN, step=1, key=f"{form_key}-downtime")
+        custom_event_type = None
+        if failure_type == FailureType.other.value:
+            custom_event_type = st.text_input("Название события", placeholder="Например, утечка сжатого воздуха",
+                                              max_chars=MAX_EVENT_TYPE_LENGTH, key=f"{form_key}-custom-type")
         with st.expander("Дата, время и запчасти"):
             left, right = st.columns(2)
-            day = left.date_input("Дата события", value=date.today(), min_value=date(1900, 1, 1), max_value=date.today(), format="DD.MM.YYYY")
-            time = right.time_input("Время события", value=None, help="Если оставить пустым, FixList подставит текущее время для сегодняшней даты или 00:00 для прошедшей.")
-            cost = st.number_input("Стоимость запчастей, ₸", min_value=0, max_value=1_000_000_000, step=1)
-        submitted = st.form_submit_button("Сохранить событие", type="primary", use_container_width=True)
+            day = left.date_input("Дата события", value=date.today(), min_value=date(1900, 1, 1), max_value=date.today(),
+                                  format="DD.MM.YYYY", key=f"{form_key}-date")
+            time = right.time_input("Время события", value=None, key=f"{form_key}-time",
+                                    help="Если оставить пустым, FixList подставит текущее время для сегодняшней даты или 00:00 для прошедшей.")
+            cost = st.number_input("Стоимость запчастей, ₸", min_value=0, max_value=1_000_000_000, step=1, key=f"{form_key}-parts")
+        submitted = st.button("Сохранить событие", type="primary", use_container_width=True, key=f"{form_key}-save")
     if submitted:
         try:
             if day is None:
@@ -78,11 +83,11 @@ def _add_event(user, equipment, open_event):
             occurred_at = datetime.combine(day, time if time is not None else (datetime.now().time() if day == date.today() else datetime.min.time()))
             equipment_id = selected if selected in labels else None
             event_id = service.add_workspace_event(user["id"], equipment_id, description, occurred_at, failure_type, downtime, cost,
-                                                   equipment_name=selected if equipment_id is None else None)
+                                                   equipment_name=selected if equipment_id is None else None,
+                                                   custom_event_type=custom_event_type)
         except ValueError as error:
             st.error(str(error))
         else:
-            st.session_state["next-event-equipment"] = service.ticket(event_id)["equipment_id"]
             st.session_state["event-form-revision"] = revision + 1
             st.session_state["workspace-event-id"] = event_id
             st.session_state["company-board-status"] = "new"

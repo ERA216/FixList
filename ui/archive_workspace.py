@@ -8,7 +8,8 @@ import pandas as pd
 import streamlit as st
 
 from backend import service
-from ui import sessions
+from backend.schemas import num
+from ui import assistant_chat, money_scenario, sessions
 from ui.charts import _render
 from ui.open_data import _kelmarsh, _maintie, _sources, duration, interval_label, number, timestamp
 from ui.theme import card, heading
@@ -41,22 +42,12 @@ def _money_panel(first, second, note, period, *, compact=False):
 
 
 def _money_estimate(hours, period="за это событие", *, compact=False):
-    """Illustrative economics, kept separate from the archive's unknown costs."""
-    hourly_rate = 50_000
-    reduction = 0.20
-    loss = max(0, hours) * hourly_rate
-
-    def amount(value):
-        if value >= 1_000_000:
-            return number(value / 1_000_000, 1) + " млн ₸"
-        rounded = round(value / 100) * 100 if value >= 100 else round(value)
-        return number(rounded) + " ₸"
-
-    note = (period.capitalize() + ". " if compact else "") + (
-        "Пример: 50 000 ₸/ч · сокращение простоя на 20%. "
-        "Расчётный сценарий, не фактические расходы или достигнутая экономия.")
-    return _money_panel(("Потери · оценка", f"≈ {amount(loss)}"), ("Потенциал экономии", f"≈ {amount(loss * reduction)}"),
-                        note, period, compact=compact)
+    result = service.downtime_scenario(hours, **money_scenario.settings())
+    prefix = period.capitalize() + ". " if compact else ""
+    reduction = num(result["reduction_percent"])
+    note = f"{prefix}{service.money_assumptions(result)} · сценарий сокращения простоя на {reduction}%."
+    return _money_panel(("Потери · оценка", service.estimated_money(result["cost_kzt"])),
+                        ("Потенциал экономии", service.estimated_money(result["savings_kzt"])), note, period, compact=compact)
 
 
 def _event_money(row, *, compact=False):
@@ -82,7 +73,7 @@ def _event_card(row, open_event):
     seconds = source["duration_seconds"] if source else row["downtime_min"] * 60
     elapsed = duration(seconds)
     text = " ".join(row["raw_text"].split())
-    label = row["failure_label"] if source else text[:150] + ("…" if len(text) > 150 else "")
+    label = row["failure_label"] if source or row["custom_event_type"] else text[:150] + ("…" if len(text) > 150 else "")
     origin = "SCADA · Код " + source["code"] if source else ("CSV" if row["source_id"] else "FIXLIST")
     with st.container(key=f'archive-card-{row["id"]}'):
         st.markdown(
@@ -144,19 +135,25 @@ def event_dialog(incident_id, admin_name):
     status = record["status"]
     if status == "archived":
         if st.button("Создать задачу по проверке сигнала", type="primary", key="archive-create-task"):
-            service.reopen_ticket(incident_id)
-            st.rerun()
+            try:
+                service.reopen_ticket(incident_id, expected_status=status)
+                st.rerun()
+            except ValueError as error:
+                st.error(str(error))
     elif status == "new":
         st.caption("Задача создана в FixList для проверки архивного сигнала.")
         if st.button("Поручить проверку сотрудникам", type="primary", key="archive-approve-task"):
-            service.approve_ticket(incident_id, admin_name)
-            st.rerun()
+            try:
+                service.approve_ticket(incident_id, admin_name, expected_status=status)
+                st.rerun()
+            except ValueError as error:
+                st.error(str(error))
     elif status in ("approved", "escalated"):
         st.caption("Результат проверки заполняет пользователь FixList.")
         resolution = st.text_area("Что проверили и что установили", key="archive-resolution")
         if st.button("Сохранить результат проверки", type="primary", key="archive-resolve-task"):
             try:
-                service.resolve_ticket(incident_id, admin_name, resolution)
+                service.resolve_ticket(incident_id, admin_name, resolution, expected_status=status)
                 st.rerun()
             except ValueError as error:
                 st.error(str(error))
@@ -271,26 +268,14 @@ def signals():
 
 
 def finance():
-    heading("06 / Деньги и экономия", "Реальные часы.\nПонятный расчёт.", "В основе — остановки Kelmarsh. Стоимость часа, планируемое сокращение простоев и затраты на меру задаются отдельно.")
+    heading("06 / Деньги и экономия", "Сколько стоит простой", "Оцените стоимость остановок Kelmarsh и возможную экономию при сокращении простоя.")
     view = service.archive_report()
-    hours = view["stats"]["downtime_seconds"] / 3600
-    _metrics([("Часы остановок", number(hours, 1), "По данным 2016 года"), ("Стоимость ремонта", "—", "В источнике не указана"), ("Подтверждённая экономия", "—", "Нет данных о результатах мер")])
-    st.subheader("Сценарий стоимости остановок")
-    st.caption("Расчёт по введённым параметрам. Полученные суммы не являются фактическими расходами ветропарка.")
-    rate = st.number_input("Стоимость часа остановки, ₸/час", min_value=0, value=None, step=1000, key="archive-hour-rate", placeholder="Укажите ваш тариф")
-    if rate is None:
-        st.info("Введите стоимость часа, чтобы получить расчёт по реальной длительности остановок.")
-        return
-    annual_cost = hours * rate
-    card("Стоимость остановок по введённому тарифу", f"{number(annual_cost)} ₸", f"{number(hours, 2)} ч × {number(rate)} ₸/ч · период 2016 года")
-    left, right = st.columns(2)
-    reduction = left.number_input("Планируемое сокращение часов, %", min_value=0, max_value=100, value=None, step=1, key="archive-reduction")
-    investment = right.number_input("Затраты на выбранную меру, ₸", min_value=0, value=None, step=1000, key="archive-investment")
-    if reduction is not None:
-        monthly = annual_cost / 12 * reduction / 100
-        card("Экономия в месяц по сценарию", f"{number(monthly)} ₸", "Среднемесячная стоимость за год × планируемое сокращение")
-        if investment is not None and monthly > 0:
-            card("Окупаемость по сценарию", number(investment / monthly, 1) + " мес.", "Затраты на меру / расчётная месячная экономия")
+    money_scenario.show(view)
+    if view["signals"]:
+        repeated = view["signals"][0]
+        equipment = repeated["events"][0]["equipment_name"]
+        st.info(f"Пример из архива: на {equipment} по коду {repeated['code']} («{repeated['label']}») зафиксировано событий: "
+                f"{repeated['count']}. Сверьте журнал по этому коду и выясните, какие остановки можно предотвратить.")
 
 
 def history():
@@ -300,25 +285,17 @@ def history():
         _sources()
 
 
-def ask():
+def ask(*, can_open_finance):
     heading("02 / Спросить ИИ", "Спросите по делу.\nОтвет — по истории.", "Реальные события Kelmarsh за 2016 год: оборудование, повторяющиеся коды и длительность остановок. Ответ опирается на записи основной базы.")
-    questions = ["Какие сигналы повторяются чаще?", "Что происходило на Kelmarsh 1?", "Сколько часов остановок в архиве?"]
+    questions = ["Какие сигналы повторяются чаще?", "Что происходило на Kelmarsh 1?", "Какая турбина простаивала дольше?"]
     picked = None
     for column, question in zip(st.columns(3), questions):
         if column.button(question, use_container_width=True, key="archive-question-" + question):
             picked = question
     chat = st.session_state.setdefault("archive-chat", [])
-    for message in chat:
-        with st.chat_message("user"):
-            st.write(message["q"])
-        with st.chat_message("assistant"):
-            st.write(message["answer"])
-            st.caption("Ответ ИИ · по данным архива" if message["mode"] == "ai" else "Ответ собран кодом из реальных записей")
+    assistant_chat.render(chat, can_open_finance=can_open_finance)
     with st.expander("Проверить разбор технической записи · MaintIE"):
         _maintie()
-    question = st.chat_input("Спросите об оборудовании или сигнале Kelmarsh") or picked
+    question = st.chat_input("Например: сколько часов простоя у Kelmarsh 1 в январе?", max_chars=2000) or picked
     if question:
-        with st.spinner("Проверяем историю оборудования…"):
-            result = service.ask_ai(question, chat)
-            chat.append({"q": question, **result})
-        st.rerun()
+        assistant_chat.reply(question, chat)

@@ -1,8 +1,10 @@
 """Фасад для интерфейса: всё, что нужно экранам, в одном месте. UI вызывает только эти функции."""
 from typing import Optional
 
-from . import advisor, analytics, auth, briefing, config, data_import, db, extract, notifications, seed, workspace_data
-from .schemas import FAILURE_LABELS, MAX_DOWNTIME_MIN, FailureType
+from . import advisor, analytics, auth, briefing, config, data_import, db, extract, finance, notifications, seed, workspace_data
+from .finance import EXAMPLE_HOUR_RATE, EXAMPLE_REDUCTION, MAX_RATE
+from .finance import amount as estimated_money, assumption_label as money_assumptions, investment_effect
+from .schemas import FAILURE_LABELS, MAX_DOWNTIME_MIN, FailureType, event_type_label
 
 
 def bootstrap() -> None:
@@ -41,9 +43,10 @@ def add_workspace_equipment(user_id, name, code="", line="", hour_cost_kzt=0):
     return workspace_data.add_equipment(user_id, name, code, line, hour_cost_kzt)
 
 
-def add_workspace_event(user_id, equipment_id, description, occurred_at, failure_type, downtime_min=0, parts_cost_kzt=0, *, equipment_name=None):
+def add_workspace_event(user_id, equipment_id, description, occurred_at, failure_type, downtime_min=0, parts_cost_kzt=0,
+                        *, equipment_name=None, custom_event_type=None):
     return workspace_data.add_event(user_id, equipment_id, description, occurred_at, failure_type, downtime_min, parts_cost_kzt,
-                                    equipment_name=equipment_name)
+                                    equipment_name=equipment_name, custom_event_type=custom_event_type)
 
 
 def failure_options(*, include_archive: bool = True) -> dict:
@@ -60,7 +63,7 @@ def analyze_text(raw: str) -> dict:
     return extract.extract(raw)
 
 
-def save_record(raw: str, drafts: list[dict], mode: str = "ai", author: Optional[str] = None) -> dict:
+def save_record(raw: str, drafts: list[dict], mode: str = "ai", author: Optional[str] = None, *, author_user_id=None) -> dict:
     """Сохранить подтверждённые мастером инциденты. Возвращает id и сигналы по затронутым станкам."""
     if not (raw or "").strip():
         raise ValueError("Пустой текст смены.")
@@ -75,7 +78,7 @@ def save_record(raw: str, drafts: list[dict], mode: str = "ai", author: Optional
         if d.get("downtime_min") is None or not 0 <= int(d["downtime_min"]) <= MAX_DOWNTIME_MIN:
             raise ValueError(f"Инцидент {i}: укажите простой от 0 до {MAX_DOWNTIME_MIN} мин.")
     with db.connect() as c:
-        log_id = db.add_shift_log(raw.strip(), "processed", mode, conn=c, author=author)
+        log_id = db.add_shift_log(raw.strip(), "processed", mode, conn=c, author=author, author_user_id=author_user_id)
         ids = [db.add_incident(log_id, {**d, "parts_cost_kzt": d.get("parts_cost_kzt")}, conn=c) for d in drafts]
         notifications.queue_incidents(ids, conn=c)
     touched = {d["equipment_id"] for d in drafts}
@@ -107,8 +110,8 @@ def incident_evidence(incident_ids: list[int]) -> list[dict]:
 
 # ---------- экран 3: план экономии ----------
 
-def savings_plan(equipment_id: str, failure_type: str) -> dict:
-    return advisor.plan(equipment_id, failure_type)
+def savings_plan(equipment_id: str, failure_type: str, custom_event_type=None) -> dict:
+    return advisor.plan(equipment_id, failure_type, custom_event_type=custom_event_type)
 
 
 def mark_applied(equipment_id: str, measure_id: str) -> None:
@@ -130,7 +133,7 @@ def history(query: str = "", limit: int = 300) -> list[dict]:
     rows = []
     for r in reversed(db.incidents()):
         row = {"Запись": f"#{r['id']}", "Дата": r["occurred_at"][:16].replace("T", " "), "Станок": r["equipment_name"],
-               "Тип": FAILURE_LABELS.get(r["failure_type"], r["failure_type"]), "Простой, мин": r["downtime_min"],
+               "Тип": event_type_label(r["failure_type"], r["custom_event_type"]), "Простой, мин": r["downtime_min"],
                "Запчасти, ₸": r["parts_cost_kzt"], "Кто записал": r.get("author_role") or "", "Исходный текст": r["raw_text"]}
         if not q or q in " ".join(map(str, row.values())).casefold():
             rows.append(row)
@@ -170,17 +173,22 @@ def reset_demo() -> None:
     seed.reset_demo()
 
 
-def ask_ai(question: str, history=None) -> dict:
-    if db.source_profile():
-        from . import archive
-        return archive.ask(question, history)
+def ask_ai(question: str, history=None, *, hourly_rate=None, reduction_percent=None) -> dict:
     from . import assistant
-    return assistant.ask(question, history)
+    return assistant.ask(question, history, hourly_rate=hourly_rate, reduction_percent=reduction_percent)
+
+
+def downtime_scenario(hours: float, *, hourly_rate=None, reduction_percent=None) -> dict:
+    return finance.scenario(hours, hourly_rate=hourly_rate, reduction_percent=reduction_percent)
+
+
+def company_money_scenario(*, hourly_rate=None, reduction_percent=None) -> dict:
+    return finance.company_report(hourly_rate=hourly_rate, reduction_percent=reduction_percent)
 
 
 # ---------- обход оборудования (сотрудник-аналитик) ----------
 
-def save_inspection(rows: list[dict], author: str) -> dict:
+def save_inspection(rows: list[dict], author: str, *, author_user_id=None) -> dict:
     """rows: [{equipment_id, state: ok|remark|problem, note, downtime_min}]. Замечания и проблемы становятся карточками."""
     eq = db.equipment_map()
     rows = [r for r in rows if r.get("equipment_id") in eq]
@@ -201,7 +209,7 @@ def save_inspection(rows: list[dict], author: str) -> dict:
             label = "Проблема" if r["state"] == "problem" else "Замечание"
             text = f"Обход · {eq[r['equipment_id']]['name']} · {label}: {note}"
             with db.connect() as c:
-                log_id = db.add_shift_log(text, "processed", "inspection", conn=c, author=author)
+                log_id = db.add_shift_log(text, "processed", "inspection", conn=c, author=author, author_user_id=author_user_id)
                 incident_id = db.add_incident(log_id, {"equipment_id": r["equipment_id"], "failure_type": extract.detect_failure(note),
                                                        "downtime_min": int(r.get("downtime_min") or 0), "parts": [], "cause": None,
                                                        "action": None, "confidence": 1.0}, conn=c)
@@ -225,7 +233,8 @@ def equipment_health() -> list[dict]:
 def _ticket(r: dict) -> dict:
     return {"id": r["id"], "time": r["occurred_at"][:16].replace("T", " "), "equipment_id": r["equipment_id"], "equipment_name": r["equipment_name"],
             "occurred_at": r["occurred_at"], "hour_cost_kzt": r["hour_cost_kzt"], "parts_cost_kzt": r["parts_cost_kzt"],
-            "failure_type": r["failure_type"], "failure_label": FAILURE_LABELS.get(r["failure_type"], r["failure_type"]),
+            "failure_type": r["failure_type"], "custom_event_type": r["custom_event_type"],
+            "failure_label": event_type_label(r["failure_type"], r["custom_event_type"]),
             "downtime_min": r["downtime_min"], "raw_text": r["raw_text"], "author": r.get("author_role") or "", "cause": r["cause"],
             "status": r.get("status") or "new", "status_label": db.STATUS_LABELS.get(r.get("status") or "new"), "assignee": r.get("assignee"),
             "resolution": r.get("resolution"), "resolved_at": r.get("resolved_at"), "approved_by": r.get("approved_by"),
@@ -238,8 +247,8 @@ def ticket(incident_id: int) -> dict | None:
     return _ticket(rows[0]) if rows else None
 
 
-def tickets(statuses: Optional[list[str]] = None, author: Optional[str] = None, limit: int | None = 100) -> list[dict]:
-    rows = [_ticket(r) for r in reversed(db.incidents())]
+def tickets(statuses: Optional[list[str]] = None, author: Optional[str] = None, limit: int | None = 100, *, author_user_id=None) -> list[dict]:
+    rows = [_ticket(r) for r in reversed(db.incidents(author_user_id=author_user_id))]
     if statuses:
         rows = [t for t in rows if t["status"] in statuses]
     if author:
@@ -262,30 +271,30 @@ def ticket_hypotheses(t: dict) -> list[dict]:
     if db.source_profile():
         return []
     from . import diagnose
-    hist = diagnose.history(t["equipment_id"], t["failure_type"])
+    hist = diagnose.history(t["equipment_id"], t["failure_type"], custom_event_type=t.get("custom_event_type"))
     return diagnose._present(diagnose.rule_rank(t["raw_text"], t["failure_type"], hist), "rules")
 
 
-def approve_ticket(incident_id: int, admin: str) -> None:
+def approve_ticket(incident_id: int, admin: str, *, expected_status=None) -> None:
     """Администратор одобряет: заявку решают сотрудники с подсказками ИИ."""
-    db.set_status(incident_id, "approved", who=admin)
+    db.set_status(incident_id, "approved", who=admin, expected_status=expected_status)
 
 
-def escalate_ticket(incident_id: int, who: str, note: str) -> None:
+def escalate_ticket(incident_id: int, who: str, note: str, *, expected_status=None) -> None:
     """Сотрудникам не хватает сил — передать администратору (запчасти, деньги, подрядчик)."""
     if not (note or "").strip():
         raise ValueError("Напишите, чего не хватает: запчасти, инструмента, знаний — администратору будет проще решить.")
-    db.set_status(incident_id, "escalated", who=who, note=note.strip())
+    db.set_status(incident_id, "escalated", who=who, note=note.strip(), expected_status=expected_status)
 
 
-def resolve_ticket(incident_id: int, who: str, resolution: str, cause: Optional[str] = None) -> None:
+def resolve_ticket(incident_id: int, who: str, resolution: str, cause: Optional[str] = None, *, expected_status=None) -> None:
     if not (resolution or "").strip():
         raise ValueError("Опишите, что сделали, — это попадёт в историю станка.")
-    db.set_status(incident_id, "resolved", who=who, resolution=resolution.strip(), cause=(cause or None))
+    db.set_status(incident_id, "resolved", who=who, resolution=resolution.strip(), cause=(cause or None), expected_status=expected_status)
 
 
-def reopen_ticket(incident_id: int) -> None:
-    db.set_status(incident_id, "new")
+def reopen_ticket(incident_id: int, *, expected_status=None) -> None:
+    db.set_status(incident_id, "new", expected_status=expected_status)
 
 
 # ---------- компании и сотрудники ----------

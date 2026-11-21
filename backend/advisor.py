@@ -113,8 +113,8 @@ def _template_summary(st: dict, best: dict) -> str:
     return txt
 
 
-def plan(equipment_id: str, failure_type: str, save: bool = True) -> dict:
-    st = analytics.group_stats(equipment_id, failure_type)
+def plan(equipment_id: str, failure_type: str, save: bool = True, *, custom_event_type=None) -> dict:
+    st = analytics.group_stats(equipment_id, failure_type, custom_event_type=custom_event_type)
     if not st.get("failures"):
         return {"stats": st, "measures": [], "summary": "За период поломок такого типа нет — мер не требуется.", "mode": "rules", "ai_generated": False}
     econ = sorted((economics(m, st) for m in candidates(failure_type)), key=_rank_key)

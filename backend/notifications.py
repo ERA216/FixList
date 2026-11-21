@@ -11,7 +11,7 @@ from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 
 from . import config, db
-from .schemas import FAILURE_LABELS
+from .schemas import event_type_label
 
 _log = logging.getLogger(__name__)
 _worker = None
@@ -100,7 +100,7 @@ def queue_incidents(incident_ids: list[int], conn) -> None:
         subject = f"FixList: новая заявка — {equipment_name}"
         body = (f"В компании «{row['company_name']}» зарегистрирована новая заявка #{row['id']}.\n\n"
                 f"Оборудование: {row['equipment_name']}\n"
-                f"Тип: {FAILURE_LABELS.get(row['failure_type'], row['failure_type'])}\n"
+                f"Тип: {event_type_label(row['failure_type'], row['custom_event_type'])}\n"
                 f"Время: {row['occurred_at'][:16].replace('T', ' ')}\n"
                 f"Простой: {row['downtime_min']} мин\n"
                 f"Сообщил: {row['author_role'] or 'Сотрудник'}\n\n"

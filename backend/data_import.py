@@ -16,7 +16,7 @@ SOURCE = "company_csv"
 
 def templates():
     equipment = ";".join(EQUIPMENT_FIELDS) + "\r\nP-01;Насос подачи;Участок 1;25000\r\n"
-    events = ";".join(EVENT_FIELDS) + "\r\nEV-001;P-01;2026-11-01 10:30;sensor;Датчик давления отключился;45;0\r\n"
+    events = ";".join(EVENT_FIELDS) + f"\r\nEV-001;P-01;{datetime.now():%Y-%m-%d %H:%M};sensor;Датчик давления отключился;45;0\r\n"
     return equipment.encode("utf-8-sig"), events.encode("utf-8-sig")
 
 
@@ -78,11 +78,13 @@ def _integer(value, field, location, maximum):
 def _timestamp(value, location):
     try:
         time = datetime.fromisoformat(value)
-        if time.tzinfo is None and 1900 <= time.year <= 2100:
-            return time.isoformat(timespec="seconds")
     except ValueError:
-        pass
-    raise ValueError(f"{location} — occurred_at: укажите местную дату и время в формате ГГГГ-ММ-ДД ЧЧ:ММ.")
+        time = None
+    if time is None or time.tzinfo is not None or not 1900 <= time.year <= 2100:
+        raise ValueError(f"{location} — occurred_at: укажите местную дату и время в формате ГГГГ-ММ-ДД ЧЧ:ММ.")
+    if time.date() > datetime.now().date():
+        raise ValueError(f"{location} — occurred_at: дата события не должна быть в будущем.")
+    return time.isoformat(timespec="seconds")
 
 
 def _validated_rows(equipment_csv, events_csv):
@@ -111,7 +113,7 @@ def _validated_rows(equipment_csv, events_csv):
     return equipment, events
 
 
-def _write_import(conn, company, author, equipment, events):
+def _write_import(conn, company, user_id, equipment, events):
     result = {"equipment_added": 0, "events_added": 0, "equipment_skipped": 0, "events_skipped": 0}
     catalog = {row["code"]: row for row in conn.execute(
         """SELECT ce.code, e.id, e.name, e.line, e.hour_cost_kzt FROM company_equipment ce
@@ -138,7 +140,7 @@ def _write_import(conn, company, author, equipment, events):
             result["events_skipped"] += 1
             continue
         incident_id = workspace_data.insert_event(conn, company, catalog[code]["id"], row["description"], row["occurred_at"],
-                                                  row["failure_type"], row["downtime_min"], row["parts_cost_kzt"], author, mode="csv")
+                                                  row["failure_type"], row["downtime_min"], row["parts_cost_kzt"], user_id, mode="csv")
         conn.execute("UPDATE incidents SET source_dataset=?, source_id=? WHERE id=?", (SOURCE, row["event_id"], incident_id))
         result["events_added"] += 1
     return result
@@ -149,8 +151,8 @@ def import_company_data(user_id, equipment_csv=None, events_csv=None):
     company = db.current_company()
     with db.connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        author = workspace_data.require_admin(conn, user_id, company)
-        return _write_import(conn, company, author, equipment, events)
+        workspace_data.require_admin(conn, user_id, company)
+        return _write_import(conn, company, user_id, equipment, events)
 
 
 def start_with_import(workspace_name, equipment_csv, events_csv=None):
@@ -160,5 +162,5 @@ def start_with_import(workspace_name, equipment_csv, events_csv=None):
     with db.connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         account = workspace_data.create_account(conn, workspace_name)
-        account["import_result"] = _write_import(conn, account["company"]["id"], account["admin"]["display_name"], equipment, events)
+        account["import_result"] = _write_import(conn, account["company"]["id"], account["admin"]["id"], equipment, events)
     return account

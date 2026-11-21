@@ -1,5 +1,5 @@
 """Check CSV import against an isolated SQLite database."""
-from datetime import datetime
+from datetime import date, timedelta
 from pathlib import Path
 import sys
 import tempfile
@@ -23,8 +23,7 @@ class DataImportTests(unittest.TestCase):
         self.user = service.login(account["company"]["code"], account["admin"]["login"], account["admin"]["pin"])
         service.use_company(self.company)
         self.addCleanup(db.set_company, 1)
-        self.equipment, events = service.data_import_templates()
-        self.events = events.replace(b"2026-11-01 10:30", datetime.now().isoformat(timespec="minutes").encode())
+        self.equipment, self.events = service.data_import_templates()
 
     def test_append_is_idempotent_and_feeds_company_workflow(self):
         service.save_record("Старая запись", [{"equipment_id": "M1", "failure_type": "other", "downtime_min": 20}])
@@ -52,6 +51,27 @@ class DataImportTests(unittest.TestCase):
         self.assertFalse(any(item.get("code") == "P-01" for item in service.equipment_options()))
         self.assertEqual(db.incidents(), [])
         self.assertEqual(db.shift_logs(), [])
+
+    def test_future_event_rejects_entire_import(self):
+        fields = self.events.splitlines()[1].split(b";")
+        tomorrow = date.today() + timedelta(days=1)
+        fields[0] = b"EV-002"
+        fields[2] = f"{tomorrow.isoformat()} 00:00".encode()
+        events = self.events + b";".join(fields) + b"\n"
+        with self.assertRaisesRegex(ValueError, "строка 3.*дата события не должна быть в будущем"):
+            service.import_company_data(self.admin, self.equipment, events)
+        self.assertFalse(any(item.get("code") == "P-01" for item in service.equipment_options()))
+        self.assertEqual(db.incidents(), [])
+
+    def test_previously_imported_future_event_stays_in_journal_but_not_in_totals(self):
+        service.import_company_data(self.admin, self.equipment, self.events)
+        ticket = service.tickets()[0]
+        tomorrow = date.today() + timedelta(days=1)
+        with db.connect() as connection:
+            connection.execute("UPDATE incidents SET occurred_at=? WHERE id=?", (f"{tomorrow.isoformat()}T00:00:00", ticket["id"]))
+        self.assertEqual(service.tickets()[0]["id"], ticket["id"])
+        self.assertEqual(service.dashboard()["total_downtime_h"], 0)
+        self.assertEqual(service.company_money_scenario()["hours"], 0)
 
     def test_company_isolation_and_protected_public_archive(self):
         service.import_company_data(self.admin, self.equipment, self.events)

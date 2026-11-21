@@ -4,7 +4,7 @@ import re
 import secrets
 
 from . import auth, db, extract, notifications
-from .schemas import MAX_DOWNTIME_MIN, FailureType
+from .schemas import MAX_DOWNTIME_MIN, MAX_EVENT_TYPE_LENGTH, FailureType
 
 
 def require_admin(conn, user_id, company_id):
@@ -25,9 +25,11 @@ def insert_equipment(conn, company_id, code, name, line, hour_cost_kzt):
     return equipment_id
 
 
-def insert_event(conn, company_id, equipment_id, description, occurred_at, failure_type, downtime_min, parts_cost_kzt, author, *, mode):
-    log_id = db.add_shift_log(description, "processed", mode, occurred_at, conn=conn, author=author, company_id=company_id)
-    return db.add_incident(log_id, {"equipment_id": equipment_id, "failure_type": failure_type,
+def insert_event(conn, company_id, equipment_id, description, occurred_at, failure_type, downtime_min, parts_cost_kzt, author_user_id,
+                 *, mode, custom_event_type=None):
+    log_id = db.add_shift_log(description, "processed", mode, occurred_at, conn=conn,
+                              author_user_id=author_user_id, company_id=company_id)
+    return db.add_incident(log_id, {"equipment_id": equipment_id, "failure_type": failure_type, "custom_event_type": custom_event_type,
                                   "downtime_min": downtime_min, "parts_cost_kzt": parts_cost_kzt}, occurred_at, conn=conn, company_id=company_id)
 
 
@@ -92,7 +94,8 @@ def _equipment_by_name(conn, company, name):
     return insert_equipment(conn, company, *_equipment_fields(name, "", "", 0))
 
 
-def add_event(user_id, equipment_id, description, occurred_at, failure_type, downtime_min=0, parts_cost_kzt=0, *, equipment_name=None):
+def add_event(user_id, equipment_id, description, occurred_at, failure_type, downtime_min=0, parts_cost_kzt=0,
+              *, equipment_name=None, custom_event_type=None):
     description = description.strip()
     if not 1 <= len(description) <= 4000:
         raise ValueError("Опишите, что произошло (до 4000 символов).")
@@ -102,12 +105,18 @@ def add_event(user_id, equipment_id, description, occurred_at, failure_type, dow
         kind = FailureType(failure_type or extract.detect_failure(description)).value
     except ValueError:
         raise ValueError("Выберите тип события из списка.") from None
+    custom_event_type = " ".join((custom_event_type or "").split()) or None
+    if custom_event_type:
+        if kind != FailureType.other.value:
+            raise ValueError("Чтобы указать своё название события, выберите тип «Прочее».")
+        if len(custom_event_type) > MAX_EVENT_TYPE_LENGTH:
+            raise ValueError(f"Название события должно содержать до {MAX_EVENT_TYPE_LENGTH} символов.")
     downtime = _number(downtime_min, MAX_DOWNTIME_MIN, "Длительность простоя")
     cost = _number(parts_cost_kzt, 1_000_000_000, "Стоимость запчастей")
     company = db.current_company()
     with db.connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        author = require_admin(conn, user_id, company)
+        require_admin(conn, user_id, company)
         if equipment_name is not None:
             equipment_id = _equipment_by_name(conn, company, equipment_name)
         elif not equipment_id:
@@ -115,6 +124,6 @@ def add_event(user_id, equipment_id, description, occurred_at, failure_type, dow
         elif not conn.execute("SELECT 1 FROM company_equipment WHERE company_id=? AND equipment_id=?", (company, equipment_id)).fetchone():
             raise ValueError("Выберите оборудование из своего справочника.")
         event_id = insert_event(conn, company, equipment_id, description, occurred_at.isoformat(timespec="seconds"),
-                                kind, downtime, cost, author, mode="manual")
+                                kind, downtime, cost, user_id, mode="manual", custom_event_type=custom_event_type)
         notifications.queue_incidents([event_id], conn=conn)
         return event_id

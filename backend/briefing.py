@@ -8,7 +8,7 @@ from datetime import date
 
 from . import analytics, db, diagnose, llm
 from .advisor import _numbers
-from .schemas import FAILURE_LABELS, BaseModel, Field, loss_label
+from .schemas import BaseModel, Field, event_type_label, loss_label
 
 BRIEF_PROMPT = """Ты помощник руководителя небольшого производства. По фактам ниже напиши короткую сводку дня.
 Факты: записи за сегодня, сигналы (повторяющиеся поломки с потерями), гипотезы причин с проверками и риски по аппаратам
@@ -33,21 +33,22 @@ class Brief(BaseModel):
     priorities: list[Priority] = Field(default_factory=list, max_length=3)
 
 
-def today_records() -> list[dict]:
-    today = date.today().isoformat()
-    rows = [r for r in db.incidents() if r["occurred_at"][:10] == today]
+def _today_records(rows) -> list[dict]:
     records = []
     for r in reversed(rows):
         loss = analytics.estimate_loss(r["downtime_min"], r["hour_cost_kzt"], r["parts_cost_kzt"])
         records.append({"id": r["id"], "time": r["occurred_at"][11:16], "equipment_id": r["equipment_id"], "equipment_name": r["equipment_name"],
-                        "failure_type": r["failure_type"], "failure_label": FAILURE_LABELS.get(r["failure_type"], r["failure_type"]),
+                        "failure_type": r["failure_type"], "failure_label": event_type_label(r["failure_type"], r["custom_event_type"]),
                         "downtime_min": r["downtime_min"], "loss_kzt": None if loss is None else round(loss), "parts_kzt": r["parts_cost_kzt"],
                         "cause": r["cause"], "raw_text": r["raw_text"], "author": r.get("author_role") or "", "is_demo": bool(r["is_demo"])})
     return records
 
 
 def today_summary() -> dict:
-    recs = today_records()
+    today = date.today().isoformat()
+    rows = [r for r in db.incidents() if r["occurred_at"][:10] == today]
+    recs = _today_records(rows)
+    hours, parts, loss = analytics.downtime_and_loss(rows)
     with db.connect() as c:
         cid = db.current_company()
         logs_today = c.execute("SELECT COUNT(*) FROM shift_logs WHERE company_id=? AND substr(created_at,1,10)=?", (cid, date.today().isoformat())).fetchone()[0]
@@ -64,9 +65,9 @@ def today_summary() -> dict:
             per_day.append({"Дата": d.strftime("%d.%m"), "Записей": int(counts.get(d, 0))})
     return {
         "logs_today": logs_today, "incidents_today": len(recs), "records": recs,
-        "downtime_h_today": round(sum(r["downtime_min"] for r in recs) / 60, 1),
-        "loss_today_kzt": analytics.sum_losses(r["loss_kzt"] for r in recs),
-        "parts_today_kzt": sum(r["parts_kzt"] or 0 for r in recs),
+        "downtime_h_today": round(hours, 1),
+        "loss_today_kzt": loss,
+        "parts_today_kzt": parts,
         "total_logs": total_logs, "history_since": (first or "")[:10], "per_day": per_day,
     }
 
@@ -76,11 +77,12 @@ def checklist(limit: int = 4) -> list[dict]:
     items = []
     for s in analytics.anomalies()[:limit]:
         notes = " ".join(r["raw_text"] for r in db.incidents(s["equipment_id"]) if r["id"] in s["incident_ids"])
-        hist = diagnose.history(s["equipment_id"], s["failure_type"])
+        hist = diagnose.history(s["equipment_id"], s["failure_type"], custom_event_type=s.get("custom_event_type"))
         top = diagnose._present(diagnose.rule_rank(notes, s["failure_type"], hist)[:1], "rules")
         if top:
             h = top[0]
             items.append({"equipment_id": s["equipment_id"], "failure_type": s["failure_type"], "equipment_name": s["equipment_name"],
+                          "custom_event_type": s.get("custom_event_type"),
                           "signal": s["title"], "loss_kzt": s["loss_kzt"], "parts_kzt": s["parts_kzt"], "severity": s["severity"], "cause": h["title"],
                           "why": h["why"], "checks": h["checks"]})
     return items

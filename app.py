@@ -10,7 +10,7 @@ from backend import service
 from backend.schemas import MAX_DOWNTIME_MIN, kzt, loss_label
 from ui.theme import apply_theme, card, deck, heading
 from ui.charts import activity_chart, downtime_chart
-from ui import archive_workspace, sessions, workspace_data
+from ui import archive_workspace, assistant_chat, money_scenario, sessions, workspace_data
 
 st.set_page_config(page_title="FixList · обходы, проблемы, решения", page_icon=str(Path(__file__).resolve().parent / "assets" / "favicon.png"), layout="wide")
 apply_theme()
@@ -24,7 +24,7 @@ def _boot(data_revision):
     return True
 
 
-_boot("company-data-import-v1")
+_boot("shift-log-author-id-v1")
 
 EXAMPLES = {
     "Станок №3 · ремень (повторяется)": "Линия 2, станок №3 встал в 14:10, порвался ремень. Поставили новый, простой 1,5 часа. Причину пока не установили.",
@@ -81,7 +81,6 @@ def enter_workspace(account):
     if "import_result" in account:
         ss["data_import_result"] = account["import_result"]
     else:
-        ss["event-equipment"] = account["equipment_id"]
         ss["workspace-message"] = "Первое оборудование сохранено. Можно записать событие."
     st.rerun()
 
@@ -305,7 +304,7 @@ def page_new_record():
             st.markdown('<div class="section-label">Как писать</div>', unsafe_allow_html=True)
             st.markdown("**Что** сломалось — номер станка.\n\n**Что** случилось — шум, перегрев, порвался ремень.\n\n**Сколько** стояли — «40 минут», «полтора часа».")
             st.caption("Заявку сразу увидит администратор. После одобрения её можно будет решить с анализом ИИ.")
-            mine = service.tickets(author=USER["display_name"], limit=3)
+            mine = service.tickets(author_user_id=USER["id"], limit=3)
             if mine:
                 st.markdown('<div class="section-label">Ваши последние заявки</div>', unsafe_allow_html=True)
                 for t in mine:
@@ -372,7 +371,7 @@ def review(raw):
                            "cause": cause or None, "action": action or None})
     if st.button("Подтвердить и сохранить", type="primary", disabled=not current) and current:
         try:
-            res = service.save_record(a["raw"], edited, a["mode"], author=USER["display_name"])
+            res = service.save_record(a["raw"], edited, a["mode"], author_user_id=USER["id"])
             ss.saved_signals = res["signals"]
             ss.pop("analysis", None)
             ss.pop("plans", None)
@@ -405,6 +404,11 @@ def render_hypotheses(d, ckey):
             b.button("Принять", key=f"acc_{ckey}_{j}", on_click=_accept, args=(ckey, hy["title"]), use_container_width=True)
 
 
+def _plan_key(event):
+    key = (event["equipment_id"], event["failure_type"])
+    return (*key, event["custom_event_type"]) if event.get("custom_event_type") else key
+
+
 def saved_signals():
     """Сигналы после сохранения: рисуются при каждой перерисовке, чтобы кнопка перехода работала."""
     if ROLE != "admin":
@@ -413,8 +417,9 @@ def saved_signals():
         return
     for s in ss.get("saved_signals", []):
         st.markdown(f'<div class="signal"><div class="signal-title">↗ &nbsp; {html.escape(s["title"])}</div><p>{html.escape(s["message"])}</p></div>', unsafe_allow_html=True)
-        if st.button("Посмотреть план экономии →", key=f"go_{s['equipment_id']}_{s['failure_type']}", type="primary"):
-            ss.plan_target = (s["equipment_id"], s["failure_type"])
+        target = _plan_key(s)
+        if st.button("Посмотреть план экономии →", key=f"go_{target}", type="primary"):
+            ss.plan_target = target
             go("План экономии")
 
 
@@ -503,7 +508,7 @@ def resolve_form(t, hyps, who, key):
     done = st.text_input("Что сделали", placeholder="Например: заменили ремень, отрегулировали натяжитель", key=f"done_{key}")
     if st.button("Решено", key=f"close_{key}", type="primary"):
         try:
-            service.resolve_ticket(t["id"], who, done, None if cause == "Не установлена" else cause)
+            service.resolve_ticket(t["id"], who, done, None if cause == "Не установлена" else cause, expected_status=t["status"])
             st.rerun()
         except ValueError as e:
             st.error(str(e))
@@ -531,12 +536,12 @@ def page_tasks():
                                         height=80, key=f"esc_{t['id']}")
                     if st.button("Передать администратору", key=f"escb_{t['id']}"):
                         try:
-                            service.escalate_ticket(t["id"], USER["display_name"], note)
+                            service.escalate_ticket(t["id"], USER["display_name"], note, expected_status=t["status"])
                             st.rerun()
                         except ValueError as e:
                             st.error(str(e))
     st.subheader("Мои заявки")
-    mine = service.tickets(author=USER["display_name"], limit=12)
+    mine = service.tickets(author_user_id=USER["id"], limit=12)
     if not mine:
         st.caption("Вы ещё не отправляли заявок.")
     cols = st.columns(3)
@@ -573,7 +578,8 @@ def page_inspection():
         label_to_id = {label: equipment_id for equipment_id, label in equipment_labels.items()}
         try:
             res = service.save_inspection([{"equipment_id": label_to_id[r["Оборудование"]], "state": STATE_OPTS[r["Состояние"]], "note": r["Комментарий"] or "",
-                                            "downtime_min": int(r["Простой, мин"] or 0)} for r in rows], USER["display_name"])
+                                            "downtime_min": int(r["Простой, мин"] or 0)} for r in rows], USER["display_name"],
+                                          author_user_id=USER["id"])
             st.success(f"Отчёт сохранён: проверено {res['checked']}, новых карточек для администратора — {len(res['cards'])}.")
         except ValueError as e:
             st.error(str(e))
@@ -604,8 +610,11 @@ def page_health():
                 st.write(h["explanation"])
                 if h["risk"] != "low" and h["failures"]:
                     if st.button("Что сделать и сколько стоит", key=f"hplan_{h['equipment_id']}", use_container_width=True):
-                        types = [t["failure_type"] for t in service.tickets(limit=999) if t["equipment_id"] == h["equipment_id"]]
-                        ss.plan_target = (h["equipment_id"], max(set(types), key=types.count) if types else "other")
+                        from datetime import date
+                        today = date.today().isoformat()
+                        types = [_plan_key(t) for t in service.tickets(limit=999)
+                                 if t["equipment_id"] == h["equipment_id"] and t["occurred_at"][:10] <= today]
+                        ss.plan_target = max(types, key=types.count) if types else (h["equipment_id"], "other")
                         go("План экономии")
 
 
@@ -646,35 +655,21 @@ def ai_warnings():
 
 
 # ---------------- спросить ИИ ----------------
-EXAMPLE_QUESTIONS = ["Что сломается первым?", "Какой станок обходится дороже всего?", "Что сделать сегодня в первую очередь?", "Что со станком №3?"]
+EXAMPLE_QUESTIONS = ["Какие заявки открыты?", "Какое оборудование простаивало дольше?", "Какие поломки повторяются?", "Что проверить в первую очередь?"]
 
 
 def page_ask():
-    heading("Спросить ИИ", "Спросите — ИИ ответит\nпо данным вашего цеха.", "ИИ видит состояние оборудования, убытки, прогнозы и открытые заявки. Отвечает только по базе: числа в ответе сверяются с данными.")
+    heading("Спросить ИИ", "Спросите по своим данным", "Укажите оборудование, период или номер записи. FixList покажет, на каких событиях основан ответ.")
     chat = ss.setdefault("chat", [])
     cols = st.columns(len(EXAMPLE_QUESTIONS))
     picked = None
     for c, q in zip(cols, EXAMPLE_QUESTIONS):
         if c.button(q, use_container_width=True, key=f"exq_{q}"):
             picked = q
-    for m in chat:
-        with st.chat_message("user"):
-            st.write(m["q"])
-        with st.chat_message("assistant"):
-            st.write(m["a"])
-            st.caption(("Анализ ИИ" if m["mode"] == "ai" else "Ответ собран кодом из базы") + (" · опирается на: " + ", ".join(m["based_on"]) if m["based_on"] else ""))
-    st.markdown('<div class="ask-label">Спросить ИИ ↓ напишите вопрос в поле внизу экрана</div>', unsafe_allow_html=True)
-    q = st.chat_input("Спросите ИИ: почему станок №4 перегревается и что делать?") or picked
+    assistant_chat.render(chat, can_open_finance="План экономии" in AVAILABLE_PAGES)
+    q = st.chat_input("Например: сколько часов простоя было за последние 7 дней?", max_chars=2000) or picked
     if q:
-        with st.spinner("ИИ анализирует базу…"):
-            try:
-                r = service.ask_ai(q, chat)
-                chat.append({"q": q, "a": r["answer"], "mode": r["mode"], "based_on": r["based_on"]})
-                if r.get("warning"):
-                    st.warning(r["warning"])
-            except ValueError as e:
-                st.error(str(e))
-        st.rerun()
+        assistant_chat.reply(q, chat)
 
 
 # ---------------- администратор: панель задач ----------------
@@ -719,17 +714,24 @@ def ticket_detail(incident_id):
 
     who = user["display_name"]
     if t["status"] == "new" and st.button("Поручить сотрудникам — решают с анализом ИИ", type="primary", key="approve"):
-        service.approve_ticket(incident_id, who)
-        st.rerun()
+        try:
+            service.approve_ticket(incident_id, who, expected_status=t["status"])
+            st.rerun()
+        except ValueError as error:
+            st.error(str(error))
     with st.expander("Проверки и рекомендации"):
         hyps = ai_hints(t)
         if hyps:
             top = hyps[0]
             if st.button("Применить решение ИИ", key=f"ai_fix_{incident_id}"):
-                service.resolve_ticket(incident_id, who, "По анализу ИИ: " + "; ".join(top["checks"]), top["title"])
-                st.rerun()
+                try:
+                    service.resolve_ticket(incident_id, who, "По анализу ИИ: " + "; ".join(top["checks"]), top["title"],
+                                           expected_status=t["status"])
+                    st.rerun()
+                except ValueError as error:
+                    st.error(str(error))
         if st.button("Деньги и экономия по этой поломке", key="to_plan"):
-            ss.plan_target = (t["equipment_id"], t["failure_type"])
+            ss.plan_target = _plan_key(t)
             go("План экономии")
     with st.expander("Записать результат проверки"):
         resolve_form(t, hyps, who, f"board_{incident_id}")
@@ -750,10 +752,10 @@ def render_checklist():
                 st.markdown(f"<span class='dot {'high' if it['severity'] == 'high' else 'medium'}'></span>**{html.escape(it['equipment_name'])}** · вероятная причина: **{html.escape(it['cause'])}**", unsafe_allow_html=True)
                 st.caption(f"{it['why']} · потери за период: {loss_label(it['loss_kzt'], it['parts_kzt'])}")
                 for j, chk in enumerate(it["checks"]):
-                    st.checkbox(chk, key=f"chk_{it['equipment_id']}_{it['failure_type']}_{j}")
+                    st.checkbox(chk, key=f"chk_{_plan_key(it)}_{j}")
             with b:
                 if ROLE == "admin" and st.button("План экономии →", key=f"plan_{i}", use_container_width=True):
-                    ss.plan_target = (it["equipment_id"], it["failure_type"])
+                    ss.plan_target = _plan_key(it)
                     go("План экономии")
 
 
@@ -811,7 +813,7 @@ def page_anomalies():
         with st.expander(f"#{e['id']} · {e['date']} · {e['downtime_min']} мин"):
             st.write(e["raw_text"])
     if st.button("Посмотреть план экономии →", type="primary"):
-        ss.plan_target = (s["equipment_id"], s["failure_type"])
+        ss.plan_target = _plan_key(s)
         go("План экономии")
     with st.expander("Потери по всем станкам"):
         st.dataframe([{"Станок": r["equipment_name"], "Поломок": r["failures"], "Простой, ч": r["downtime_h"],
@@ -821,10 +823,14 @@ def page_anomalies():
 
 # ---------------- 03 · план экономии ----------------
 def page_plan():
-    heading("03 / План экономии", "Исправляйте то,\nчто меняет результат.", "Меры — из базы, деньги — по формулам, выбор и объяснение — от ИИ. Эффект мер — оценка, а не гарантия.")
+    heading("03 / Деньги и экономия", "Сколько стоит простой", "Оцените потери по своему журналу, проверьте окупаемость и сравните меры для конкретной проблемы.")
+    money_scenario.show()
+    if not EQ_LABEL:
+        return
+    st.subheader("Меры для конкретной проблемы")
     dash = service.dashboard()
-    targets = [(s["equipment_id"], s["failure_type"]) for s in dash["anomalies"]]
-    names = {(s["equipment_id"], s["failure_type"]): s["title"] for s in dash["anomalies"]}
+    names = {_plan_key(s): s["title"] for s in dash["anomalies"]}
+    targets = list(names)
     cur = ss.get("plan_target")
     if cur and cur not in targets:
         targets.insert(0, cur)
@@ -835,7 +841,7 @@ def page_plan():
         ft = c2.selectbox("Тип", list(FAILURES), format_func=FAILURES.get)
         targets = [(eq, ft)]
     t = st.selectbox("Для какой проблемы", targets, index=targets.index(cur) if cur in targets else 0,
-                     format_func=lambda x: names.get(x, f"{EQ_LABEL[x[0]]} · {FAILURES[x[1]]}"))
+                     format_func=lambda x: names.get(x, f"{EQ_LABEL[x[0]]} · {x[2] if len(x) == 3 else FAILURES[x[1]]}"))
     ss.plan_target = t
     plans = ss.setdefault("plans", {})
     if t not in plans or st.button("Пересчитать"):
@@ -930,6 +936,7 @@ if PUBLIC_ARCHIVE:
     archive_workspace.source_banner()
     pages.update({"Панель задач": lambda: archive_workspace.board(USER, board_data_controls), "Состояние оборудования": archive_workspace.health,
                   "Сводка дня": archive_workspace.daily, "Аномалии": archive_workspace.signals,
-                  "План экономии": archive_workspace.finance, "История и эффект": archive_workspace.history, "Спросить ИИ": archive_workspace.ask})
+                  "План экономии": archive_workspace.finance, "История и эффект": archive_workspace.history,
+                  "Спросить ИИ": lambda: archive_workspace.ask(can_open_finance="План экономии" in AVAILABLE_PAGES)})
 pages[ss.page]()
 

@@ -1,17 +1,27 @@
 """Проверки бэкенда без сети: python -m pytest -q  (или python tests/test_backend.py)."""
 import json
-import os
+from contextlib import ExitStack
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-os.environ["DB_PATH"] = str(Path(tempfile.mkdtemp()) / "test.db")
-os.environ["LLM_PROVIDER"] = "mock"
 
 from backend import advisor, analytics, config, extract, llm, service  # noqa: E402
 
-service.reset_demo()
+
+def setup_module():
+    global _test_scope
+    with ExitStack() as stack:
+        root = Path(stack.enter_context(tempfile.TemporaryDirectory()))
+        stack.enter_context(patch.multiple(config, DB_PATH=root / "test.db", LLM_PROVIDER="mock", SMTP_PORT=0))
+        service.reset_demo()
+        _test_scope = stack.pop_all()
+
+
+def teardown_module():
+    _test_scope.close()
 
 
 def test_demo_story_numbers():
@@ -340,7 +350,11 @@ def test_inspection_creates_cards_and_health_forecast():
 
 
 if __name__ == "__main__":
-    for name, fn in list(globals().items()):
-        if name.startswith("test_"):
-            fn()
-            print("ok", name)
+    setup_module()
+    try:
+        for name, fn in list(globals().items()):
+            if name.startswith("test_"):
+                fn()
+                print("ok", name)
+    finally:
+        teardown_module()
