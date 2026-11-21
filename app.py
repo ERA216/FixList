@@ -10,7 +10,7 @@ from backend import service
 from backend.schemas import MAX_DOWNTIME_MIN, kzt, loss_label
 from ui.theme import apply_theme, card, deck, heading
 from ui.charts import activity_chart, downtime_chart
-from ui import archive_workspace, assistant_chat, money_scenario, sessions, workspace_data
+from ui import archive_workspace, assistant_chat, money_scenario, sessions, ticket_plan, workspace_data
 
 st.set_page_config(page_title="FixList · обходы, проблемы, решения", page_icon=str(Path(__file__).resolve().parent / "assets" / "favicon.png"), layout="wide")
 apply_theme()
@@ -24,7 +24,7 @@ def _boot(data_revision):
     return True
 
 
-_boot("shift-log-author-id-v1")
+_boot("ticket-solution-confirmation-v1")
 
 EXAMPLES = {
     "Станок №3 · ремень (повторяется)": "Линия 2, станок №3 встал в 14:10, порвался ремень. Поставили новый, простой 1,5 часа. Причину пока не установили.",
@@ -527,7 +527,8 @@ def page_tasks():
             with a:
                 ticket_card(t)
             with b:
-                hyps = ai_hints(t)
+                confirmed = t["confirmed_solution"]
+                hyps = ticket_plan.show_confirmed(confirmed) if confirmed else ai_hints(t)
                 tab1, tab2 = st.tabs(["Решили сами", "Нужна помощь администратора"])
                 with tab1:
                     resolve_form(t, hyps, USER["display_name"], f"w{t['id']}")
@@ -677,9 +678,13 @@ def page_board():
     heading("01 / Панель задач", "Выберите, что решить\nв первую очередь.", "Добавляйте свои события, открывайте карточки и поручайте проверки сотрудникам.")
     board_data_controls()
     ai_warnings()
+    focused_ticket = ss.pop("ticket-confirmed", None)
+    if focused_ticket:
+        ss["company-board-status"] = "approved"
+        st.success("Решение сохранено. Задача в работе.")
     cnt = service.ticket_counts()
     labels = {"escalated": f"Нужна помощь · {cnt['escalated']}", "new": f"Ждут одобрения · {cnt['new']}",
-              "approved": f"Решают сотрудники · {cnt['approved']}", "resolved": "Решённые"}
+              "approved": f"В работе · {cnt['approved']}", "resolved": "Решённые"}
     if "company-board-status" not in ss:
         ss["company-board-status"] = "escalated" if cnt["escalated"] else "new"
     status = st.radio("Фильтр", list(labels), format_func=labels.get, horizontal=True, label_visibility="collapsed",
@@ -691,6 +696,8 @@ def page_board():
     page_size = 12
     pages = math.ceil(len(items) / page_size)
     page_key = f"board-page-{status}"
+    if focused_ticket:
+        ss[page_key] = next((index // page_size + 1 for index, row in enumerate(items) if row["id"] == focused_ticket), 1)
     if ss.get(page_key, 1) > pages:
         ss[page_key] = 1
     page = st.number_input("Страница", min_value=1, max_value=pages, step=1, key=page_key) if pages > 1 else 1
@@ -710,30 +717,22 @@ def ticket_detail(incident_id):
         st.warning(f"{t['assignee'] or 'Сотрудник'}: {t['escalation_note']}")
     if t["status"] == "resolved":
         st.success(f"Решено: {t['resolution'] or '—'}" + (f" · причина: {t['cause']}" if t["cause"] else "") + (f" · {t['assignee']}" if t["assignee"] else ""))
+        ticket_plan.render(t, user)
         return
 
+    if st.button("Деньги и экономия по этой поломке", key="to_plan"):
+        ss.plan_target = _plan_key(t)
+        go("План экономии")
+    result_area = st.container()
+    hyps = ticket_plan.render(t, user)
     who = user["display_name"]
-    if t["status"] == "new" and st.button("Поручить сотрудникам — решают с анализом ИИ", type="primary", key="approve"):
+    if t["status"] == "new" and st.button("Поручить сотрудникам", type="primary", key="approve", use_container_width=True):
         try:
             service.approve_ticket(incident_id, who, expected_status=t["status"])
             st.rerun()
         except ValueError as error:
             st.error(str(error))
-    with st.expander("Проверки и рекомендации"):
-        hyps = ai_hints(t)
-        if hyps:
-            top = hyps[0]
-            if st.button("Применить решение ИИ", key=f"ai_fix_{incident_id}"):
-                try:
-                    service.resolve_ticket(incident_id, who, "По анализу ИИ: " + "; ".join(top["checks"]), top["title"],
-                                           expected_status=t["status"])
-                    st.rerun()
-                except ValueError as error:
-                    st.error(str(error))
-        if st.button("Деньги и экономия по этой поломке", key="to_plan"):
-            ss.plan_target = _plan_key(t)
-            go("План экономии")
-    with st.expander("Записать результат проверки"):
+    with result_area, st.expander("Записать результат проверки"):
         resolve_form(t, hyps, who, f"board_{incident_id}")
 
 
@@ -934,7 +933,7 @@ pages = {"Спросить ИИ": page_ask, "Обход": page_inspection, "Но
          "Сводка дня": page_brief, "Аномалии": page_anomalies, "План экономии": page_plan, "История и эффект": page_history, "Сотрудники": page_staff}
 if PUBLIC_ARCHIVE:
     archive_workspace.source_banner()
-    pages.update({"Панель задач": lambda: archive_workspace.board(USER, board_data_controls), "Состояние оборудования": archive_workspace.health,
+    pages.update({"Панель задач": lambda: archive_workspace.board(board_data_controls), "Состояние оборудования": archive_workspace.health,
                   "Сводка дня": archive_workspace.daily, "Аномалии": archive_workspace.signals,
                   "План экономии": archive_workspace.finance, "История и эффект": archive_workspace.history,
                   "Спросить ИИ": lambda: archive_workspace.ask(can_open_finance="План экономии" in AVAILABLE_PAGES)})

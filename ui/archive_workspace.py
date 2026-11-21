@@ -9,7 +9,7 @@ import streamlit as st
 
 from backend import service
 from backend.schemas import num
-from ui import assistant_chat, money_scenario, sessions
+from ui import assistant_chat, money_scenario, sessions, ticket_plan
 from ui.charts import _render
 from ui.open_data import _kelmarsh, _maintie, _sources, duration, interval_label, number, timestamp
 from ui.theme import card, heading
@@ -125,26 +125,29 @@ def render_event_details(row):
 
 
 @st.dialog("Событие оборудования", width="large")
-def event_dialog(incident_id, admin_name):
-    service.use_company(sessions.require_user()["company_id"])
+def event_dialog(incident_id):
+    user = sessions.require_user()
+    service.use_company(user["company_id"])
     record = service.ticket(incident_id)
     if not record:
         st.error("Запись не найдена.")
         return
     render_event_details(record)
     status = record["status"]
+    if status == "new":
+        st.caption("Задача создана в FixList для проверки архивного сигнала.")
+    ticket_plan.render(record, user)
     if status == "archived":
-        if st.button("Создать задачу по проверке сигнала", type="primary", key="archive-create-task"):
+        if st.button("Создать задачу по проверке сигнала", type="primary", key="archive-create-task", use_container_width=True):
             try:
                 service.reopen_ticket(incident_id, expected_status=status)
                 st.rerun()
             except ValueError as error:
                 st.error(str(error))
     elif status == "new":
-        st.caption("Задача создана в FixList для проверки архивного сигнала.")
-        if st.button("Поручить проверку сотрудникам", type="primary", key="archive-approve-task"):
+        if st.button("Поручить проверку сотрудникам", type="primary", key="archive-approve-task", use_container_width=True):
             try:
-                service.approve_ticket(incident_id, admin_name, expected_status=status)
+                service.approve_ticket(incident_id, user["display_name"], expected_status=status)
                 st.rerun()
             except ValueError as error:
                 st.error(str(error))
@@ -153,7 +156,7 @@ def event_dialog(incident_id, admin_name):
         resolution = st.text_area("Что проверили и что установили", key="archive-resolution")
         if st.button("Сохранить результат проверки", type="primary", key="archive-resolve-task"):
             try:
-                service.resolve_ticket(incident_id, admin_name, resolution, expected_status=status)
+                service.resolve_ticket(incident_id, user["display_name"], resolution, expected_status=status)
                 st.rerun()
             except ValueError as error:
                 st.error(str(error))
@@ -162,13 +165,18 @@ def event_dialog(incident_id, admin_name):
         st.caption("Дата записи результата: " + (record.get("resolved_at") or "—"))
 
 
-def board(user, add_data):
+def board(add_data):
     heading("01 / Панель задач", "Сигналы записаны.\nПроверки под контролем.", "Реальные остановки оборудования Kelmarsh. Откройте исходное событие и создайте задачу по его проверке.")
     add_data()
+    focused_ticket = st.session_state.pop("ticket-confirmed", None)
+    if focused_ticket:
+        st.session_state["archive-board-filter"] = "В работе"
+        st.session_state["archive-board-search"] = ""
+        st.success("Решение сохранено. Задача в работе.")
     counts = service.ticket_counts()
     _metrics([("Событий в архиве", len(service.archive_report()["rows"]), "Исходные записи Kelmarsh"),
               ("Новых задач", counts["new"], "Проверки, созданные в FixList"),
-              ("В работе", counts["approved"] + counts["escalated"], "Текущий статус задач FixList")])
+              ("В работе", counts["approved"], "Текущий статус задач FixList")])
     statuses = {"Архив событий": "archived", "Новые задачи": "new", "В работе": "approved", "Нужна помощь": "escalated", "Проверены": "resolved"}
     selected = st.radio("Показать", list(statuses), horizontal=True, key="archive-board-filter")
     rows = service.tickets([statuses[selected]], limit=10000)
@@ -177,12 +185,16 @@ def board(user, add_data):
     if not rows:
         st.info("В этом разделе пока нет записей. Задачи на проверку создаются из архивного события.")
         return
-    pages = max(1, math.ceil(len(rows) / 12))
+    page_size = 12
+    pages = math.ceil(len(rows) / page_size)
+    if focused_ticket:
+        st.session_state["archive-board-page"] = next(
+            (index // page_size + 1 for index, row in enumerate(rows) if row["id"] == focused_ticket), 1)
     if st.session_state.get("archive-board-page", 1) > pages:
         st.session_state["archive-board-page"] = 1
-    page = st.number_input("Страница", min_value=1, max_value=pages, value=1, step=1, key="archive-board-page")
+    page = st.number_input("Страница", min_value=1, max_value=pages, step=1, key="archive-board-page")
     st.caption(f"Найдено: {len(rows)} · страница {page} из {pages} · сначала новые события")
-    event_grid(rows[(page - 1) * 12:page * 12], lambda incident_id: event_dialog(incident_id, user["display_name"]))
+    event_grid(rows[(page - 1) * page_size:page * page_size], event_dialog)
 
 
 def health():
@@ -234,8 +246,7 @@ def daily():
         st.subheader("События выбранного дня")
         st.caption("Карточка показывает полную длительность исходного события; в сводке выше учитывается только часть внутри выбранных суток.")
         tickets = {row["id"]: row for row in service.tickets(limit=10000)}
-        event_grid([tickets[row["incident_id"]] for row in view["rows"]],
-                   lambda incident_id: event_dialog(incident_id, st.session_state["user"]["display_name"]))
+        event_grid([tickets[row["incident_id"]] for row in view["rows"]], event_dialog)
     else:
         st.info("В этот день в выбранном архиве остановок этой категории нет.")
 

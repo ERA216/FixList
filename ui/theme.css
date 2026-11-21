@@ -240,7 +240,9 @@ html, body, .stApp, .stApp p, .stApp li, .stApp label, .stApp input, .stApp text
   position:relative; border-radius:20px;
   & .stElementContainer:has(> .stButton), & .stButton {position:static;}
   & .stButton button:hover {transform:none;}
-  & .stButton button::after {content:""; position:absolute; inset:0; z-index:1; cursor:pointer;}
+  & :is([class*="st-key-archive-open-"], [class*="st-key-archive-equipment-open-"]) button::after {
+    content:""; position:absolute; inset:0; z-index:1; cursor:pointer;
+  }
   &:has(.stButton button:focus-visible) {outline:2px solid #b94922; outline-offset:2px;}
 }
 

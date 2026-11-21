@@ -12,6 +12,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from backend import analytics, config, db, extract, service
 from backend.schemas import ExtractionResult
+from backend.ticket_plan import CauseSelection
 
 
 class WorkspaceDataTests(unittest.TestCase):
@@ -58,6 +59,139 @@ class WorkspaceDataTests(unittest.TestCase):
             service.add_workspace_equipment(demo["id"], "Фильтр")
         self.assertEqual(len(service.archive_report()["rows"]), 177)
         self.assertEqual(len(service.equipment_options()), 6)
+
+    def test_ticket_plan_uses_only_matching_evidence_and_keeps_the_ticket_open(self):
+        account = service.start_workspace("Мастерская", "Компрессор", "C-01")
+        company, admin = account["company"], account["admin"]
+        service.use_company(company["id"])
+        equipment = account["equipment_id"]
+        incident = service.add_workspace_event(admin["id"], equipment, "Перегрев. На радиаторе много пыли.",
+                                               datetime.now(), "overheating")
+        with patch("backend.config.ai_enabled", return_value=True), patch("backend.llm.call_json") as model:
+            model.return_value = CauseSelection.model_validate({
+                "cause_ids": ["C07", "C06"], "answer": "Радиатор уже заменили.",
+            })
+            plan = service.ticket_recommendation(incident)
+            self.assertEqual(plan["mode"], "ai")
+            self.assertEqual([item["id"] for item in plan["hypotheses"]], ["C06"])
+            self.assertEqual(plan["hypotheses"][0]["signs"], ["пыли"])
+            self.assertIn("очистку радиатора", plan["hypotheses"][0]["solution"])
+            self.assertIn("сигнал перегрева не повторяется", plan["hypotheses"][0]["verify"])
+            self.assertNotIn("уже заменили", str(plan))
+            model.return_value = CauseSelection(cause_ids=["C99"])
+            fallback = service.ticket_recommendation(incident)
+            self.assertEqual(fallback["mode"], "rules")
+            self.assertEqual(fallback["hypotheses"][0]["solution"], plan["hypotheses"][0]["solution"])
+        rejected = service.add_workspace_event(admin["id"], equipment, "Перегрев, пыли на радиаторе нет.",
+                                               datetime.now(), "overheating")
+        recommendation = service.ticket_recommendation(rejected)
+        self.assertEqual(recommendation["hypotheses"], [])
+        self.assertIn("Поручите специалисту", recommendation["solution"])
+        self.assertNotIn("очистку радиатора", recommendation["solution"])
+        other = service.add_workspace_equipment(admin["id"], "Насос", "P-01")
+        text = "C-01 перегрелся, простой 10 минут. P-01 перегрелся, на радиаторе много пыли, простой 15 минут."
+        ids = service.save_record(text, [
+            {"equipment_id": equipment, "failure_type": "overheating", "downtime_min": 10},
+            {"equipment_id": other, "failure_type": "overheating", "downtime_min": 15},
+        ])["incident_ids"]
+        self.assertFalse(service.ticket_recommendation(ids[0])["hypotheses"])
+        self.assertEqual(service.ticket_recommendation(ids[1])["hypotheses"][0]["id"], "C06")
+        self.assertEqual(service.ticket(incident)["status"], "new")
+        self.assertIsNone(service.ticket(incident)["resolution"])
+
+    def test_task_board_confirms_the_plan_and_records_the_actual_work_separately(self):
+        from streamlit.testing.v1 import AppTest
+
+        account = service.start_workspace("Мастерская", "Компрессор", "C-01")
+        company, admin = account["company"], account["admin"]
+        service.use_company(company["id"])
+        incident = service.add_workspace_event(admin["id"], account["equipment_id"], "Перегрев. На радиаторе много пыли.",
+                                                datetime.now(), "overheating")
+        app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py"), default_timeout=25)
+        app.session_state["user"] = service.login(company["code"], admin["login"], admin["pin"])
+        app.session_state["session-expires-at"] = time() + 3600
+        app.run()
+        app.button(key=f"archive-open-{incident}").click().run()
+        self.assertFalse(app.exception)
+        self.assertFalse(any(item.label == "Предложить решение с ИИ" for item in app.button))
+        self.assertTrue(any("Загрязнение радиатора и вентиляции" in item.value for item in app.markdown))
+        self.assertTrue(any("очистку радиатора" in item.value for item in app.markdown))
+        self.assertTrue(any("сигнал перегрева не повторяется" in item.value for item in app.markdown))
+        self.assertTrue(any(item.label == "Что сделали" for item in app.text_input))
+        self.assertFalse(any(item.key == f"ai_fix_{incident}" for item in app.button))
+        service.use_company(company["id"])
+        self.assertEqual(service.ticket(incident)["status"], "new")
+        self.assertIsNone(service.ticket(incident)["resolution"])
+        self.assertIsNone(service.ticket(incident)["confirmed_solution"])
+
+        # AppTest runs the full page, so also trigger the dialog for its widget events.
+        next(button for button in app.button if button.label == "Решить с ИИ").click()
+        app.button(key=f"archive-open-{incident}").click().run()
+        self.assertFalse(app.exception)
+        self.assertEqual(app.radio(key="company-board-status").value, "approved")
+        service.use_company(company["id"])
+        ticket = service.ticket(incident)
+        self.assertEqual(ticket["status"], "approved")
+        self.assertIsNone(ticket["resolution"])
+        self.assertIn("очистку радиатора", ticket["confirmed_solution"]["solution"])
+
+        worker = service.add_workers(company["id"], "Сотрудник")[0]
+        worker_app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py"), default_timeout=25)
+        worker_app.session_state["user"] = service.login(company["code"], worker["login"], worker["pin"])
+        worker_app.session_state["session-expires-at"] = time() + 3600
+        worker_app.session_state["page"] = "Мои задачи"
+        worker_app.run()
+        self.assertFalse(worker_app.exception)
+        self.assertTrue(any(item.value == "Подтверждённое решение" for item in worker_app.subheader))
+        self.assertTrue(any("очистку радиатора" in item.value for item in worker_app.markdown))
+
+        app.button(key=f"archive-open-{incident}").click().run()
+        self.assertFalse(app.exception)
+        self.assertTrue(any(item.value == "Подтверждённое решение" for item in app.subheader))
+        self.assertFalse(any(item.label == "Решить с ИИ" for item in app.button))
+        app.button(key=f"close_board_{incident}").click()
+        app.button(key=f"archive-open-{incident}").click().run()
+        self.assertTrue(any("Опишите, что сделали" in item.value for item in app.error))
+        app.text_input(key=f"done_board_{incident}").set_value("Очистили радиатор, температура в норме.")
+        app.button(key=f"close_board_{incident}").click()
+        app.button(key=f"archive-open-{incident}").click().run()
+        self.assertFalse(app.exception)
+        service.use_company(company["id"])
+        resolved = service.ticket(incident)
+        self.assertEqual(resolved["status"], "resolved")
+        self.assertEqual(resolved["resolution"], "Очистили радиатор, температура в норме.")
+        self.assertEqual(resolved["confirmed_solution"], ticket["confirmed_solution"])
+
+    def test_only_one_admin_can_confirm_a_current_proposal(self):
+        account = service.start_workspace("Мастерская", "Компрессор", "C-01")
+        company, admin = account["company"], account["admin"]
+        service.use_company(company["id"])
+        incident = service.add_workspace_event(admin["id"], account["equipment_id"], "Перегрев. На радиаторе много пыли.",
+                                                datetime.now(), "overheating")
+        proposal = service.ticket_recommendation(incident)
+        worker = service.add_workers(company["id"], "Сотрудник")[0]
+        with self.assertRaisesRegex(ValueError, "администратор"):
+            service.confirm_ticket_solution(incident, worker["id"], proposal)
+        with self.assertRaisesRegex(ValueError, "для другой задачи"):
+            service.confirm_ticket_solution(incident + 1, admin["id"], proposal)
+        service.approve_ticket(incident, admin["display_name"])
+        with self.assertRaisesRegex(ValueError, "уже изменилась"):
+            service.confirm_ticket_solution(incident, admin["id"], proposal)
+        current = service.ticket_recommendation(incident)
+        simultaneous = Barrier(2, timeout=5)
+
+        def confirm(_):
+            service.use_company(company["id"])
+            simultaneous.wait()
+            try:
+                service.confirm_ticket_solution(incident, admin["id"], current)
+            except ValueError:
+                return False
+            return True
+
+        with ThreadPoolExecutor(2) as executor:
+            self.assertCountEqual(executor.map(confirm, range(2)), [False, True])
+        self.assertEqual(service.ticket(incident)["confirmed_solution"]["solution"], current["proposed_solution"]["solution"])
 
     def test_event_form_can_create_and_reuse_equipment_by_name(self):
         account = service.start_workspace("Мастерская", "Насос")

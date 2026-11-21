@@ -100,6 +100,39 @@ class PrimaryArchiveTests(unittest.TestCase):
         self.assertGreaterEqual(view["stats"]["downtime_seconds"], 34060)
         self.assertLessEqual(view["stats"]["downtime_seconds"], 6 * 86400)
 
+    def test_board_solution_uses_the_archived_signal_without_a_repair_claim(self):
+        from streamlit.testing.v1 import AppTest
+
+        self.install()
+        record = service.tickets(["archived"], limit=1)[0]
+        app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py"), default_timeout=25)
+        app.session_state["user"] = service.login("FIXLIST", "boss", "1111")
+        app.session_state["session-expires-at"] = time() + 3600
+        app.run()
+        app.button(key=f"archive-open-{record['id']}").click().run()
+        self.assertFalse(app.exception)
+        self.assertTrue(any(item.value == "Решение ИИ" for item in app.subheader))
+        self.assertTrue(any(item.value == "**Как проверить результат**" for item in app.markdown))
+        self.assertTrue(any(f"Код {record['source_record']['code']}" in item.value for item in app.text))
+        self.assertEqual(service.ticket(record["id"])["status"], "archived")
+        self.assertIsNone(service.ticket(record["id"])["resolution"])
+        next(button for button in app.button if button.label == "Решить с ИИ").click()
+        app.button(key=f"archive-open-{record['id']}").click().run()
+        self.assertFalse(app.exception)
+        self.assertEqual(app.radio(key="archive-board-filter").value, "В работе")
+        self.assertEqual(service.ticket(record["id"])["status"], "approved")
+        self.assertEqual(service.ticket(record["id"])["source_record"], record["source_record"])
+        self.assertIsNone(service.ticket(record["id"])["resolution"])
+        self.assertEqual(len(service.archive_report()["rows"]), 177)
+        app.button(key=f"archive-open-{record['id']}").click().run()
+        self.assertFalse(app.exception)
+        self.assertTrue(any(item.value == "Подтверждённое решение" for item in app.subheader))
+
+        pressure = next(row for row in db.incidents() if row["source_record"]["message"] == "Low hydraulic pressure")
+        recommendation = service.ticket_recommendation(pressure["id"])
+        self.assertIn("Если сервис подтвердит утечку", recommendation["solution"])
+        self.assertIn("давление удерживается в допустимом диапазоне", recommendation["verify"])
+
     def test_chat_reports_unknown_cost_and_future_failure_honestly(self):
         self.install()
         answer = service.ask_ai("Какой убыток у Kelmarsh 1?")

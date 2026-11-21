@@ -1,4 +1,5 @@
 """Фасад для интерфейса: всё, что нужно экранам, в одном месте. UI вызывает только эти функции."""
+import json
 from typing import Optional
 
 from . import advisor, analytics, auth, briefing, config, data_import, db, extract, finance, notifications, seed, workspace_data
@@ -231,13 +232,18 @@ def equipment_health() -> list[dict]:
 # ---------- заявки: новая → в работе → решена ----------
 
 def _ticket(r: dict) -> dict:
+    status = r.get("status") or "new"
+    confirmed = r.get("confirmed_solution_json")
     return {"id": r["id"], "time": r["occurred_at"][:16].replace("T", " "), "equipment_id": r["equipment_id"], "equipment_name": r["equipment_name"],
             "occurred_at": r["occurred_at"], "hour_cost_kzt": r["hour_cost_kzt"], "parts_cost_kzt": r["parts_cost_kzt"],
             "failure_type": r["failure_type"], "custom_event_type": r["custom_event_type"],
             "failure_label": event_type_label(r["failure_type"], r["custom_event_type"]),
             "downtime_min": r["downtime_min"], "raw_text": r["raw_text"], "author": r.get("author_role") or "", "cause": r["cause"],
-            "status": r.get("status") or "new", "status_label": db.STATUS_LABELS.get(r.get("status") or "new"), "assignee": r.get("assignee"),
-            "resolution": r.get("resolution"), "resolved_at": r.get("resolved_at"), "approved_by": r.get("approved_by"),
+            "status": status, "status_label": db.STATUS_LABELS.get(status), "assignee": r.get("assignee"),
+            "can_confirm_solution": status in db.SOLUTION_CONFIRMATION_STATUSES and not confirmed,
+            "confirmed_solution": json.loads(confirmed) if confirmed else None,
+            "resolution": r.get("resolution"), "resolved_at": r.get("resolved_at"), "taken_at": r.get("taken_at"),
+            "approved_by": r.get("approved_by"),
             "escalation_note": r.get("escalation_note"), "is_demo": bool(r["is_demo"]),
             "source_id": r.get("source_id"), "source_dataset": r.get("source_dataset"), "source_record": r.get("source_record")}
 
@@ -273,6 +279,29 @@ def ticket_hypotheses(t: dict) -> list[dict]:
     from . import diagnose
     hist = diagnose.history(t["equipment_id"], t["failure_type"], custom_event_type=t.get("custom_event_type"))
     return diagnose._present(diagnose.rule_rank(t["raw_text"], t["failure_type"], hist), "rules")
+
+
+def ticket_recommendation(incident_id: int) -> dict:
+    from . import ticket_plan
+
+    rows = db.incidents(incident_id=incident_id)
+    if not rows:
+        raise ValueError("Запись не найдена в текущем кабинете.")
+    row = rows[0]
+    plan = ticket_plan.for_incident(row)
+    primary = plan["hypotheses"][0] if plan["hypotheses"] else plan
+    return {**plan, "incident_id": incident_id,
+            "version": (row["status"], row["taken_at"], row["cause"], row["resolution"]),
+            "proposed_solution": {"title": primary.get("title"), "solution": primary["solution"],
+                                  "verify": primary["verify"], "checks": primary.get("checks", plan["steps"]),
+                                  "mode": plan["mode"]}}
+
+
+def confirm_ticket_solution(incident_id: int, user_id: int, proposal: dict) -> None:
+    """Confirm the server-generated proposal displayed for this task."""
+    if proposal["incident_id"] != incident_id:
+        raise ValueError("Это решение подготовлено для другой задачи. Откройте карточку заново.")
+    db.confirm_solution(incident_id, user_id, proposal["version"], proposal["proposed_solution"])
 
 
 def approve_ticket(incident_id: int, admin: str, *, expected_status=None) -> None:

@@ -100,10 +100,11 @@ CREATE INDEX IF NOT EXISTS idx_email_outbox_ready ON email_outbox(state, next_at
 """
 SCOPED_TABLES = ("shift_logs", "incidents", "recommendations", "applied_measures")
 INCIDENT_STATUS_COLUMNS = {"status": "TEXT NOT NULL DEFAULT 'new'", "assignee": "TEXT", "taken_at": "TEXT", "resolved_at": "TEXT",
-                           "resolution": "TEXT", "approved_by": "TEXT", "escalation_note": "TEXT"}
+                           "resolution": "TEXT", "approved_by": "TEXT", "escalation_note": "TEXT", "confirmed_solution_json": "TEXT"}
 # путь заявки: сотрудник сообщил → администратор одобрил → сотрудники решают с ИИ → (нужна помощь → администратор) → решена
-STATUS_LABELS = {"new": "Ждёт одобрения", "approved": "Решают сотрудники", "escalated": "Нужна помощь администратора", "resolved": "Решена"}
+STATUS_LABELS = {"new": "Ждёт одобрения", "approved": "В работе", "escalated": "Нужна помощь администратора", "resolved": "Решена"}
 STATUS_LABELS["archived"] = "Архивное событие"
+SOLUTION_CONFIRMATION_STATUSES = {"archived", "new", "approved", "escalated"}
 TICKET_TRANSITIONS = {
     "new": {"archived", "resolved"},
     "approved": {"new"},
@@ -386,7 +387,32 @@ def set_status(incident_id: int, status: str, who: Optional[str] = None, resolut
                          WHERE id=? AND company_id=?""", (now_iso(), resolution, cause, who, *target))
         else:
             c.execute("""UPDATE incidents SET status='new', approved_by=NULL, escalation_note=NULL,
-                         resolved_at=NULL, taken_at=NULL, assignee=NULL WHERE id=? AND company_id=?""", target)
+                         resolved_at=NULL, taken_at=NULL, assignee=NULL, confirmed_solution_json=NULL
+                         WHERE id=? AND company_id=?""", target)
+
+
+def confirm_solution(incident_id: int, user_id: int, version: tuple, solution: dict) -> None:
+    """Save the displayed plan and begin work in one guarded update."""
+    if version[0] not in SOLUTION_CONFIRMATION_STATUSES:
+        raise ValueError("Для этой задачи уже нельзя подтвердить решение. Откройте карточку заново.")
+    company_id = current_company()
+    with connect() as c:
+        c.execute("BEGIN IMMEDIATE")
+        admin = c.execute("SELECT display_name FROM users WHERE id=? AND company_id=? AND role='admin'",
+                          (user_id, company_id)).fetchone()
+        if not admin:
+            raise ValueError("Подтвердить решение может администратор этого кабинета.")
+        now = now_iso()
+        saved = {**solution, "confirmed_by": admin["display_name"], "confirmed_at": now}
+        updated = c.execute("""UPDATE incidents SET status='approved', confirmed_solution_json=?,
+                               approved_by=COALESCE(CASE WHEN status='approved' THEN approved_by END, ?),
+                               taken_at=COALESCE(CASE WHEN status='approved' THEN taken_at END, ?),
+                               escalation_note=NULL, assignee=CASE WHEN status='escalated' THEN NULL ELSE assignee END
+                               WHERE id=? AND company_id=? AND confirmed_solution_json IS NULL
+                                 AND status=? AND taken_at IS ? AND cause IS ? AND resolution IS ?""",
+                            (json.dumps(saved, ensure_ascii=False), admin["display_name"], now, incident_id, company_id, *version))
+        if not updated.rowcount:
+            raise ValueError("Задача уже изменилась или решение подтверждено. Откройте карточку заново.")
 
 
 def log_llm_call(purpose: str, provider: str, model: str, latency_ms: int, ok: bool, attempts: int, error: Optional[str]) -> None:
