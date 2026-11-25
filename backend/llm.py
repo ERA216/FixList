@@ -5,6 +5,7 @@
 import json
 import re
 import time
+from contextvars import ContextVar
 from typing import Type, TypeVar
 
 import requests
@@ -13,11 +14,14 @@ from pydantic import BaseModel, ValidationError
 from . import config, db
 
 T = TypeVar("T", bound=BaseModel)
+_schema = ContextVar("llm_response_schema", default=None)
+_deadline = ContextVar("llm_deadline", default=None)
+_used_model = ContextVar("llm_used_model", default=None)
 
 
 class LLMError(Exception):
     """Базовая ошибка ИИ. message — текст для пользователя."""
-    user_message = "ИИ-сервис временно недоступен. Запись сохранена, разбор выполнен по правилам."
+    user_message = "ИИ-сервис временно недоступен. Показан результат по правилам."
 
 
 class LLMUnavailable(LLMError):
@@ -45,8 +49,11 @@ class LLMBadOutput(LLMError):
 
 
 def _post(url: str, headers: dict, body: dict) -> dict:
+    remaining = (_deadline.get() - time.monotonic()) if _deadline.get() is not None else config.LLM_TIMEOUT
+    if remaining <= 0:
+        raise LLMOverloaded("request budget exceeded")
     try:
-        r = requests.post(url, headers=headers, json=body, timeout=config.LLM_TIMEOUT)
+        r = requests.post(url, headers=headers, json=body, timeout=min(config.LLM_TIMEOUT, remaining))
     except requests.Timeout as e:
         raise LLMOverloaded(f"timeout: {e}") from e  # модель не успела ответить — пробуем другую
     except requests.ConnectionError as e:
@@ -61,21 +68,36 @@ def _post(url: str, headers: dict, body: dict) -> dict:
         raise LLMOverloaded(f"HTTP {r.status_code}: {r.text[:200]}")
     if r.status_code >= 400:
         raise LLMUnavailable(f"HTTP {r.status_code}: {r.text[:300]}")
-    return r.json()
+    try:
+        data = r.json()
+    except ValueError as e:
+        raise LLMBadOutput("provider returned non-JSON HTTP response") from e
+    if not isinstance(data, dict):
+        raise LLMBadOutput("provider returned a non-object HTTP response")
+    return data
 
 
 def _gemini(system: str, user: str, key: str, model: str) -> str:
+    generation = {"responseMimeType": "application/json"}
+    if _schema.get() is not None:
+        generation["responseJsonSchema"] = _schema.get()
     data = _post(
         f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
         {"x-goog-api-key": key, "Content-Type": "application/json"},
         {"systemInstruction": {"parts": [{"text": system}]},
          "contents": [{"role": "user", "parts": [{"text": user}]}],
-         "generationConfig": {"temperature": 0.1, "responseMimeType": "application/json"}},
+         "generationConfig": generation},
     )
     try:
-        return "".join(part.get("text", "") for part in data["candidates"][0]["content"]["parts"])
-    except (KeyError, IndexError) as e:
-        raise LLMBadOutput(f"empty gemini response: {str(data)[:200]}") from e
+        candidate = data["candidates"][0]
+        if candidate.get("finishReason", "STOP") != "STOP":
+            raise LLMBadOutput("Gemini response was blocked or incomplete")
+        text = "".join(part.get("text", "") for part in candidate["content"]["parts"] if not part.get("thought"))
+        if not text.strip():
+            raise LLMBadOutput("empty Gemini response")
+        return text
+    except (KeyError, IndexError, TypeError) as e:
+        raise LLMBadOutput("Gemini returned no usable text") from e
 
 
 _working = {}  # запоминаем рабочую пару ключ/модель, чтобы не перебирать каждый раз
@@ -84,8 +106,9 @@ _working = {}  # запоминаем рабочую пару ключ/моде�
 def _call_gemini(system: str, user: str) -> str:
     """Перебор: рабочая пара → другие модели (при 404/503) → другой ключ (при 429/401). Два прохода с паузой."""
     keys = config.api_keys()
-    models = list(dict.fromkeys([_working.get("model") or config.LLM_MODEL] + config.GEMINI_FALLBACK_MODELS))
-    if _working.get("key") in keys:
+    cached = _working.get("key") in keys and _working.get("configured_model") == config.LLM_MODEL
+    models = list(dict.fromkeys([(_working.get("model") if cached else None) or config.LLM_MODEL] + config.GEMINI_FALLBACK_MODELS))
+    if cached:
         keys = [_working["key"]] + [k for k in keys if k != _working["key"]]
     last: LLMError = LLMUnavailable("no keys")
     started = time.monotonic()
@@ -93,6 +116,9 @@ def _call_gemini(system: str, user: str) -> str:
         if round_:
             if not isinstance(last, LLMOverloaded):
                 break
+            remaining = (_deadline.get() - time.monotonic()) if _deadline.get() is not None else config.LLM_TOTAL_BUDGET
+            if remaining <= 2:
+                raise last
             time.sleep(2)  # перегрузка обычно кратковременная
         for key in keys:
             for model in models:
@@ -100,7 +126,8 @@ def _call_gemini(system: str, user: str) -> str:
                     raise last  # не держим пользователя дольше бюджета — дальше резервный режим
                 try:
                     text = _gemini(system, user, key, model)
-                    _working.update(key=key, model=model)
+                    _working.update(key=key, model=model, configured_model=config.LLM_MODEL)
+                    _used_model.set(model)
                     return text
                 except (LLMModelNotFound, LLMOverloaded) as e:
                     last = e
@@ -154,6 +181,9 @@ def call_json(system: str, user: str, schema: Type[T], purpose: str) -> T:
         raise LLMUnavailable("no api key")  # резервный режим — не считаем это неудачным вызовом
     started, attempts, last_err = time.monotonic(), 0, None
     prompt = user
+    schema_token = _schema.set(schema.model_json_schema())
+    deadline_token = _deadline.set(started + config.LLM_TOTAL_BUDGET)
+    model_token = _used_model.set(None)
     try:
         for attempts in range(1, config.LLM_MAX_RETRIES + 2):
             try:
@@ -164,7 +194,7 @@ def call_json(system: str, user: str, schema: Type[T], purpose: str) -> T:
                 raise LLMUnavailable(f"{type(e).__name__}: {e}") from e
             try:
                 result = schema.model_validate(_parse_json(raw))
-                db.log_llm_call(purpose, config.LLM_PROVIDER, _working.get("model", config.LLM_MODEL), int((time.monotonic() - started) * 1000), True, attempts, None)
+                db.log_llm_call(purpose, config.LLM_PROVIDER, _used_model.get() or config.LLM_MODEL, int((time.monotonic() - started) * 1000), True, attempts, None)
                 return result
             except (json.JSONDecodeError, ValidationError) as e:
                 last_err = str(e)[:800]
@@ -172,5 +202,10 @@ def call_json(system: str, user: str, schema: Type[T], purpose: str) -> T:
                           f"Верни исправленный JSON строго по схеме, без пояснений.")
         raise LLMBadOutput(last_err or "invalid output")
     except LLMError as e:
-        db.log_llm_call(purpose, config.LLM_PROVIDER, config.LLM_MODEL, int((time.monotonic() - started) * 1000), False, attempts, f"{type(e).__name__}: {e}")
+        # Provider messages can echo credentials. Never persist their raw contents.
+        db.log_llm_call(purpose, config.LLM_PROVIDER, config.LLM_MODEL, int((time.monotonic() - started) * 1000), False, attempts, type(e).__name__)
         raise
+    finally:
+        _schema.reset(schema_token)
+        _deadline.reset(deadline_token)
+        _used_model.reset(model_token)

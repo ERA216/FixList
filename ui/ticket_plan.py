@@ -44,8 +44,10 @@ def render(record, user, history, *, assignee_user_id=None):
     solutions = st.session_state.setdefault("ticket-solution-previews", {})
     version = (record["status"], record["taken_at"], record["cause"], record["resolution"])
     history_version = tuple((entry["id"], entry["resolved_at"]) for entry in history["entries"])
+    ai_signature = service.ai_settings_signature()
     plan = solutions.get(incident_id)
-    if plan is None or plan["version"] != version or plan.get("history_version") != history_version:
+    if (plan is None or plan["version"] != version or plan.get("history_version") != history_version
+            or plan.get("ai_signature") != ai_signature):
         with st.spinner("Подбираем решение по данным карточки…"):
             try:
                 plan = service.ticket_recommendation(incident_id)
@@ -55,6 +57,7 @@ def render(record, user, history, *, assignee_user_id=None):
             # Bind the action to the proposal the user saw before the dialog reruns.
             plan["button_key"] = f"ticket-apply-{incident_id}-{uuid4().hex}"
             plan["history_version"] = history_version
+            plan["ai_signature"] = ai_signature
             solutions[incident_id] = plan
 
     with st.container(border=True, key=f"ticket-solution-result-{incident_id}"):
@@ -63,6 +66,16 @@ def render(record, user, history, *, assignee_user_id=None):
         _show_action(action)
         if plan["mode"] != "ai":
             st.caption("По справочнику FixList и данным карточки")
+        else:
+            st.caption("ИИ выбрал проверки · факты и действия сверены с данными карточки")
+        if commentary := plan.get("ai_commentary"):
+            st.markdown("**Пояснение ИИ**")
+            st.write(commentary)
+        if plan.get("warning"):
+            st.caption(plan["warning"])
+            if st.button("Повторить запрос к ИИ", key=f"ticket-retry-ai-{incident_id}"):
+                solutions.pop(incident_id, None)
+                st.rerun()
         for evidence in plan["evidence"]:
             st.text(evidence)
         signs = plan["hypotheses"][0]["signs"] if plan["hypotheses"] else []
