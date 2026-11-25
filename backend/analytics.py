@@ -22,9 +22,9 @@ def sum_losses(values):
     return None if any(pd.isna(value) for value in values) else round(sum(values))
 
 
-def downtime_and_loss(rows):
-    totals = finance.for_events(rows, hourly_rate=0)
-    costs = [row["parts_cost_kzt"] for row in rows]
+def downtime_and_loss(rows, period=None):
+    totals = finance.for_events(rows, period, hourly_rate=0)
+    costs = [row["parts_cost_kzt"] for row in rows if finance.event_starts_in_period(row, period)]
     parts = int(sum(cost for cost in costs if not pd.isna(cost)))
     loss = None if totals["unrated_hours"] or any(pd.isna(cost) for cost in costs) else round(totals["rated_cost_kzt"] + parts)
     return totals["hours"], parts, loss

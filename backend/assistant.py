@@ -77,16 +77,6 @@ def _window(scope, is_archive):
     return today - timedelta(days=config.ANALYSIS_WINDOW_DAYS - 1), today
 
 
-def _filter(rows, period, is_archive):
-    if not period:
-        return rows
-    if is_archive:
-        lo, hi = open_data.period_bounds(*period)
-        return [row for row in rows if open_data._time(row["source_record"]["started_at"]) < hi
-                and open_data._time(row["source_record"]["ended_at"]) > lo]
-    return [row for row in rows if period[0].isoformat() <= row["occurred_at"][:10] <= period[1].isoformat()]
-
-
 def _hours(rows, period):
     return round(finance.for_events(rows, period, hourly_rate=0)["hours"], 2)
 
@@ -143,8 +133,9 @@ def _money_answer(rows, period, is_archive, **assumptions):
     if all(row.get("source_record") for row in rows):
         lines.append("В архиве нет тарифов и расходов на ремонт. Экономия рассчитана по сценарию.")
     else:
-        parts = sum(row["parts_cost_kzt"] or 0 for row in rows)
-        if result["unrated_hours"] or any(row["parts_cost_kzt"] is None for row in rows):
+        costs = [row["parts_cost_kzt"] for row in rows if finance.event_starts_in_period(row, period)]
+        parts = sum(cost or 0 for cost in costs)
+        if result["unrated_hours"] or any(cost is None for cost in costs):
             lines.append(f"В журнале нет полной оценки расходов. Известные расходы (запчасти {kzt(parts)} ₸) указаны отдельно." if parts else
                          "В журнале нет полной оценки расходов.")
         elif parts:
@@ -232,7 +223,8 @@ def ask(question: str, history=None, *, hourly_rate=None, reduction_percent=None
     period = _window(scope, is_archive)
     if is_archive and period is None and scope.event_id is None:
         return respond("Архив Kelmarsh охватывает 2016 год. За запрошенный период данных нет; укажите даты 2016 года.")
-    rows = _filter(rows, period, is_archive and scope.event_id is None)
+    include_downtime = is_archive and scope.event_id is None or scope.topic in {"downtime", "money", "overview"}
+    rows = finance.events_in_period(rows, period, include_downtime=include_downtime)
     if not rows:
         if scope.event_id is not None:
             return respond(f"Запись №{scope.event_id} не найдена в текущем кабинете или не соответствует указанному фильтру.")

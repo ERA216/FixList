@@ -6,7 +6,7 @@
 import json
 from datetime import date
 
-from . import analytics, db, diagnose, llm
+from . import analytics, db, diagnose, finance, llm
 from .advisor import _numbers
 from .schemas import BaseModel, Field, event_type_label, loss_label
 
@@ -33,39 +33,42 @@ class Brief(BaseModel):
     priorities: list[Priority] = Field(default_factory=list, max_length=3)
 
 
-def _today_records(rows) -> list[dict]:
+def _today_records(rows, period) -> list[dict]:
     records = []
     for r in reversed(rows):
-        loss = analytics.estimate_loss(r["downtime_min"], r["hour_cost_kzt"], r["parts_cost_kzt"])
+        minutes = finance.downtime_minutes_in_period(r, period)
+        loss = analytics.estimate_loss(minutes, r["hour_cost_kzt"], r["parts_cost_kzt"])
         records.append({"id": r["id"], "time": r["occurred_at"][11:16], "equipment_id": r["equipment_id"], "equipment_name": r["equipment_name"],
                         "failure_type": r["failure_type"], "failure_label": event_type_label(r["failure_type"], r["custom_event_type"]),
-                        "downtime_min": r["downtime_min"], "loss_kzt": None if loss is None else round(loss), "parts_kzt": r["parts_cost_kzt"],
+                        "downtime_min": int(minutes) if minutes == int(minutes) else round(minutes, 2),
+                        "loss_kzt": None if loss is None else round(loss), "parts_kzt": r["parts_cost_kzt"],
                         "cause": r["cause"], "raw_text": r["raw_text"], "author": r.get("author_role") or "", "is_demo": bool(r["is_demo"])})
     return records
 
 
 def today_summary() -> dict:
-    today = date.today().isoformat()
-    rows = [r for r in db.incidents() if r["occurred_at"][:10] == today]
-    recs = _today_records(rows)
-    hours, parts, loss = analytics.downtime_and_loss(rows)
+    today = date.today()
+    period = (today, today)
+    rows = finance.events_in_period(db.incidents(), period)
+    recs = _today_records([r for r in rows if finance.event_starts_in_period(r, period)], period)
+    hours, parts, loss = analytics.downtime_and_loss(rows, period)
     with db.connect() as c:
         cid = db.current_company()
-        logs_today = c.execute("SELECT COUNT(*) FROM shift_logs WHERE company_id=? AND substr(created_at,1,10)=?", (cid, date.today().isoformat())).fetchone()[0]
+        logs_today = c.execute("SELECT COUNT(*) FROM shift_logs WHERE company_id=? AND substr(created_at,1,10)=?", (cid, today.isoformat())).fetchone()[0]
         total_logs = c.execute("SELECT COUNT(*) FROM shift_logs WHERE company_id=?", (cid,)).fetchone()[0]
         first = c.execute("SELECT MIN(created_at) FROM shift_logs WHERE company_id=?", (cid,)).fetchone()[0]
     df = analytics.incidents_df()
     per_day = []
     if not df.empty:
-        start = date.fromordinal(date.today().toordinal() - 6)
+        start = date.fromordinal(today.toordinal() - 6)
         last7 = df[df["occurred_at"].dt.date >= start]
         counts = last7.groupby(last7["occurred_at"].dt.date).size()
         for i in range(6, -1, -1):
-            d = date.fromordinal(date.today().toordinal() - i)
+            d = date.fromordinal(today.toordinal() - i)
             per_day.append({"Дата": d.strftime("%d.%m"), "Записей": int(counts.get(d, 0))})
     return {
         "logs_today": logs_today, "incidents_today": len(recs), "records": recs,
-        "downtime_h_today": round(hours, 1),
+        "downtime_h_today": round(hours, 2),
         "loss_today_kzt": loss,
         "parts_today_kzt": parts,
         "total_logs": total_logs, "history_since": (first or "")[:10], "per_day": per_day,
@@ -92,6 +95,9 @@ def _template(summary: dict, checks: list[dict]) -> dict:
     if summary["incidents_today"]:
         head = (f"Сегодня записано инцидентов: {summary['incidents_today']}, простой {str(summary['downtime_h_today']).replace('.', ',')} ч, "
                 f"потери: {loss_label(summary['loss_today_kzt'], summary['parts_today_kzt'])}.")
+    elif summary["downtime_h_today"]:
+        head = ("Сегодня новых инцидентов не записано. Простой по ранее начатым остановкам за сегодня "
+                f"составил {str(summary['downtime_h_today']).replace('.', ',')} ч.")
     else:
         head = "Сегодня новых инцидентов не записано."
     points = [f"{c['equipment_name']}: {c['signal'].split(' · ')[-1].lower()}, потери за период: {loss_label(c['loss_kzt'], c['parts_kzt'])}." for c in checks[:3]]

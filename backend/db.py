@@ -100,7 +100,8 @@ CREATE INDEX IF NOT EXISTS idx_email_outbox_ready ON email_outbox(state, next_at
 """
 SCOPED_TABLES = ("shift_logs", "incidents", "recommendations", "applied_measures")
 INCIDENT_STATUS_COLUMNS = {"status": "TEXT NOT NULL DEFAULT 'new'", "assignee": "TEXT", "taken_at": "TEXT", "resolved_at": "TEXT",
-                           "resolution": "TEXT", "approved_by": "TEXT", "escalation_note": "TEXT", "confirmed_solution_json": "TEXT"}
+                           "resolution": "TEXT", "approved_by": "TEXT", "escalation_note": "TEXT",
+                           "confirmed_solution_json": "TEXT", "assignee_user_id": "INTEGER"}
 # путь заявки: сотрудник сообщил → администратор одобрил → сотрудники решают с ИИ → (нужна помощь → администратор) → решена
 STATUS_LABELS = {"new": "Ждёт одобрения", "approved": "В работе", "escalated": "Нужна помощь администратора", "resolved": "Решена"}
 STATUS_LABELS["archived"] = "Архивное событие"
@@ -250,33 +251,31 @@ def add_shift_log(raw_text: str, status: str, mode: str, created_at: Optional[st
 
 
 def add_incident(log_id: int, inc: dict, occurred_at: Optional[str] = None, is_demo: bool = False, conn=None, *, company_id: Optional[int] = None) -> int:
+    company = company_id or current_company()
     parts = inc.get("parts") or []
     parts_cost = inc.get("parts_cost_kzt")
-    if parts_cost is None:
+    unknown_cost = not is_demo and (inc.get("parts_cost_known") is False
+                                    or (parts_cost is None and bool(source_profile(company))))
+    if unknown_cost:
+        parts_cost = 0
+    elif parts_cost is None:
         parts_cost = sum(part_price(p.get("name", "")) * int(p.get("qty", 1)) for p in parts)
     sql = """INSERT INTO incidents(log_id, occurred_at, equipment_id, failure_type, custom_event_type, downtime_min,
-             parts_cost_kzt, parts_json, cause, action, confidence, needs_review, is_demo, company_id)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
-    company = company_id or current_company()
+             parts_cost_kzt, parts_json, cause, action, confidence, needs_review, is_demo, company_id, parts_cost_known)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
     args = (log_id, occurred_at or now_iso(), inc["equipment_id"], inc["failure_type"], inc.get("custom_event_type"), int(inc["downtime_min"]),
             int(parts_cost), json.dumps(parts, ensure_ascii=False), inc.get("cause"), inc.get("action"),
-            inc.get("confidence"), int(bool(inc.get("needs_review"))), int(is_demo), company)
-    unknown_cost = not is_demo and inc.get("parts_cost_kzt") is None and bool(source_profile(company))
-    if conn is not None:
-        incident_id = conn.execute(sql, args).lastrowid
-        if unknown_cost:
-            conn.execute("UPDATE incidents SET parts_cost_known=0 WHERE id=?", (incident_id,))
-        return incident_id
-    with connect() as c:
-        incident_id = c.execute(sql, args).lastrowid
-        if unknown_cost:
-            c.execute("UPDATE incidents SET parts_cost_known=0 WHERE id=?", (incident_id,))
-        return incident_id
+            inc.get("confidence"), int(bool(inc.get("needs_review"))), int(is_demo), company, int(not unknown_cost))
+    with (connect() if conn is None else nullcontext(conn)) as c:
+        return c.execute(sql, args).lastrowid
 
 
-def incidents(equipment_id: Optional[str] = None, *, incident_id: Optional[int] = None, author_user_id: Optional[int] = None) -> list[dict]:
-    q = """SELECT i.*, s.raw_text, s.author_role, s.mode AS log_mode, e.name AS equipment_name, e.hour_cost_kzt, e.hour_cost_known
+def incidents(equipment_id: Optional[str] = None, *, incident_id: Optional[int] = None,
+              author_user_id: Optional[int] = None, worker_user_id: Optional[int] = None) -> list[dict]:
+    q = """SELECT i.*, s.raw_text, s.author_role, s.mode AS log_mode, e.name AS equipment_name, e.hour_cost_kzt, e.hour_cost_known,
+                  assignee.display_name AS assignee_name, assignee.login AS assignee_login
            FROM incidents i JOIN shift_logs s ON s.id = i.log_id JOIN equipment e ON e.id = i.equipment_id
+           LEFT JOIN users assignee ON assignee.id=i.assignee_user_id AND assignee.company_id=i.company_id
            WHERE i.company_id = ?"""
     args: tuple = (current_company(),)
     if source_profile():
@@ -294,6 +293,10 @@ def incidents(equipment_id: Optional[str] = None, *, incident_id: Optional[int] 
                   AND (SELECT COUNT(*) FROM users peer WHERE peer.company_id=u.company_id
                        AND peer.display_name=u.display_name)=1)))"""
         args += (author_user_id,)
+    if worker_user_id is not None:
+        q += """ AND EXISTS (SELECT 1 FROM users worker WHERE worker.id=? AND worker.company_id=i.company_id AND worker.role='worker')
+                  AND (i.assignee_user_id IS NULL OR i.assignee_user_id=?)"""
+        args += (worker_user_id, worker_user_id)
     with connect() as c:
         rows = [dict(r) for r in c.execute(q + " ORDER BY i.occurred_at", args)]
     for r in rows:
@@ -364,22 +367,77 @@ def set_meta(key: str, value: str) -> None:
         c.execute("INSERT INTO meta(key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
 
 
+def _require_assignable_worker(conn, user_id: int, company_id: int) -> None:
+    if not conn.execute("SELECT 1 FROM users WHERE id=? AND company_id=? AND role='worker'",
+                        (user_id, company_id)).fetchone():
+        raise ValueError("Выберите сотрудника этого кабинета.")
+
+
+def assign_ticket(incident_id: int, actor_user_id: int, assignee_user_id: int, *,
+                  expected_assignee_user_id: Optional[int]) -> None:
+    """Set the worker on an in-progress ticket without restarting the work."""
+    company_id = current_company()
+    with connect() as c:
+        c.execute("BEGIN IMMEDIATE")
+        if not c.execute("SELECT 1 FROM users WHERE id=? AND company_id=? AND role='admin'",
+                         (actor_user_id, company_id)).fetchone():
+            raise ValueError("Назначить исполнителя может администратор этого кабинета.")
+        _require_assignable_worker(c, assignee_user_id, company_id)
+        updated = c.execute("""UPDATE incidents SET assignee_user_id=?
+                               WHERE id=? AND company_id=? AND status='approved' AND assignee_user_id IS ?""",
+                            (assignee_user_id, incident_id, company_id, expected_assignee_user_id))
+        if not updated.rowcount:
+            raise ValueError("Задача недоступна для назначения или уже изменилась. Откройте карточку заново.")
+
+
+def resume_ticket(incident_id: int, actor_user_id: int, *, expected_status: str = "escalated") -> None:
+    """Return an escalated ticket to its assigned worker and retain the existing plan."""
+    company_id = current_company()
+    with connect() as c:
+        c.execute("BEGIN IMMEDIATE")
+        if not c.execute("SELECT 1 FROM users WHERE id=? AND company_id=? AND role='admin'",
+                         (actor_user_id, company_id)).fetchone():
+            raise ValueError("Вернуть задачу в работу может администратор этого кабинета.")
+        updated = c.execute("""UPDATE incidents SET status='approved', escalation_note=NULL, assignee=NULL
+                               WHERE id=? AND company_id=? AND status='escalated' AND status=?""",
+                            (incident_id, company_id, expected_status))
+        if not updated.rowcount:
+            raise ValueError("Задача недоступна для возврата в работу или уже изменилась. Откройте карточку заново.")
+
+
 def set_status(incident_id: int, status: str, who: Optional[str] = None, resolution: Optional[str] = None,
-               cause: Optional[str] = None, note: Optional[str] = None, *, expected_status=None) -> None:
+               cause: Optional[str] = None, note: Optional[str] = None, *, expected_status=None,
+               actor_user_id: Optional[int] = None, assignee_user_id: Optional[int] = None) -> None:
     if status not in TICKET_TRANSITIONS:
         raise ValueError("Неизвестный статус")
     target = (incident_id, current_company())
     with connect() as c:
         c.execute("BEGIN IMMEDIATE")
-        row = c.execute("SELECT status FROM incidents WHERE id=? AND company_id=?", target).fetchone()
+        row = c.execute("SELECT status, assignee_user_id FROM incidents WHERE id=? AND company_id=?", target).fetchone()
         if not row:
             raise ValueError("Заявка не найдена")
         current = row["status"]
         if current not in TICKET_TRANSITIONS[status] or (expected_status is not None and current != expected_status):
             label = STATUS_LABELS.get(current, current or "неизвестен")
             raise ValueError(f"Действие недоступно для текущего статуса «{label}». Откройте карточку заново.")
+        if actor_user_id is not None:
+            actor = c.execute("SELECT role, display_name FROM users WHERE id=? AND company_id=?",
+                              (actor_user_id, target[1])).fetchone()
+            if not actor:
+                raise ValueError("Действие доступно сотрудникам этого кабинета.")
+            if actor["role"] != "admin":
+                if current != "approved" or status not in {"escalated", "resolved"}:
+                    raise ValueError("Действие доступно только администратору.")
+                if row["assignee_user_id"] not in (None, actor_user_id):
+                    raise ValueError("Эта задача назначена другому сотруднику.")
+            who = actor["display_name"]
+        elif assignee_user_id is not None or row["assignee_user_id"] is not None:
+            raise ValueError("Войдите в кабинет, чтобы изменить назначенную задачу.")
         if status == "approved":
-            c.execute("UPDATE incidents SET status='approved', approved_by=?, taken_at=? WHERE id=? AND company_id=?", (who, now_iso(), *target))
+            if assignee_user_id is not None:
+                _require_assignable_worker(c, assignee_user_id, target[1])
+            c.execute("""UPDATE incidents SET status='approved', approved_by=?, taken_at=?, assignee_user_id=?
+                         WHERE id=? AND company_id=?""", (who, now_iso(), assignee_user_id, *target))
         elif status == "escalated":
             c.execute("UPDATE incidents SET status='escalated', escalation_note=?, assignee=? WHERE id=? AND company_id=?", (note, who, *target))
         elif status == "resolved":
@@ -387,11 +445,12 @@ def set_status(incident_id: int, status: str, who: Optional[str] = None, resolut
                          WHERE id=? AND company_id=?""", (now_iso(), resolution, cause, who, *target))
         else:
             c.execute("""UPDATE incidents SET status='new', approved_by=NULL, escalation_note=NULL,
-                         resolved_at=NULL, taken_at=NULL, assignee=NULL, confirmed_solution_json=NULL
+                         resolved_at=NULL, taken_at=NULL, assignee=NULL, assignee_user_id=NULL, confirmed_solution_json=NULL
                          WHERE id=? AND company_id=?""", target)
 
 
-def confirm_solution(incident_id: int, user_id: int, version: tuple, solution: dict) -> None:
+def confirm_solution(incident_id: int, user_id: int, version: tuple, solution: dict, *,
+                     assignee_user_id: Optional[int] = None) -> None:
     """Save the displayed plan and begin work in one guarded update."""
     if version[0] not in SOLUTION_CONFIRMATION_STATUSES:
         raise ValueError("Для этой задачи уже нельзя подтвердить решение. Откройте карточку заново.")
@@ -402,15 +461,19 @@ def confirm_solution(incident_id: int, user_id: int, version: tuple, solution: d
                           (user_id, company_id)).fetchone()
         if not admin:
             raise ValueError("Подтвердить решение может администратор этого кабинета.")
+        if assignee_user_id is not None:
+            _require_assignable_worker(c, assignee_user_id, company_id)
         now = now_iso()
         saved = {**solution, "confirmed_by": admin["display_name"], "confirmed_at": now}
         updated = c.execute("""UPDATE incidents SET status='approved', confirmed_solution_json=?,
                                approved_by=COALESCE(CASE WHEN status='approved' THEN approved_by END, ?),
                                taken_at=COALESCE(CASE WHEN status='approved' THEN taken_at END, ?),
+                               assignee_user_id=COALESCE(?, assignee_user_id),
                                escalation_note=NULL, assignee=CASE WHEN status='escalated' THEN NULL ELSE assignee END
                                WHERE id=? AND company_id=? AND confirmed_solution_json IS NULL
                                  AND status=? AND taken_at IS ? AND cause IS ? AND resolution IS ?""",
-                            (json.dumps(saved, ensure_ascii=False), admin["display_name"], now, incident_id, company_id, *version))
+                            (json.dumps(saved, ensure_ascii=False), admin["display_name"], now, assignee_user_id,
+                             incident_id, company_id, *version))
         if not updated.rowcount:
             raise ValueError("Задача уже изменилась или решение подтверждено. Откройте карточку заново.")
 

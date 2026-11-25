@@ -1,4 +1,5 @@
 """Фасад для интерфейса: всё, что нужно экранам, в одном месте. UI вызывает только эти функции."""
+from datetime import datetime
 import json
 from typing import Optional
 
@@ -78,6 +79,19 @@ def save_record(raw: str, drafts: list[dict], mode: str = "ai", author: Optional
             raise ValueError(f"Инцидент {i}: выберите тип неисправности.")
         if d.get("downtime_min") is None or not 0 <= int(d["downtime_min"]) <= MAX_DOWNTIME_MIN:
             raise ValueError(f"Инцидент {i}: укажите простой от 0 до {MAX_DOWNTIME_MIN} мин.")
+        if "parts_cost_known" in d:
+            parts = d.get("parts", [])
+            if not isinstance(parts, list) or any(
+                not isinstance(part, dict) or not isinstance(part.get("name"), str) or not part["name"].strip()
+                or type(part.get("qty")) is not int or not 1 <= part["qty"] <= 100 for part in parts
+            ):
+                raise ValueError(f"Инцидент {i}: укажите название и целое количество от 1 до 100 для каждой запчасти.")
+            cost = d.get("parts_cost_kzt")
+            cost_known = d["parts_cost_known"]
+            if not isinstance(cost_known, bool) or (cost_known and (type(cost) is not int or not 0 <= cost <= 1_000_000_000)):
+                raise ValueError(f"Инцидент {i}: укажите целую стоимость запчастей от 0 до 1 000 000 000 ₸.")
+            if not cost_known and cost is not None:
+                raise ValueError(f"Инцидент {i}: подтвердите стоимость запчастей или оставьте её пустой.")
     with db.connect() as c:
         log_id = db.add_shift_log(raw.strip(), "processed", mode, conn=c, author=author, author_user_id=author_user_id)
         ids = [db.add_incident(log_id, {**d, "parts_cost_kzt": d.get("parts_cost_kzt")}, conn=c) for d in drafts]
@@ -240,6 +254,7 @@ def _ticket(r: dict) -> dict:
             "failure_label": event_type_label(r["failure_type"], r["custom_event_type"]),
             "downtime_min": r["downtime_min"], "raw_text": r["raw_text"], "author": r.get("author_role") or "", "cause": r["cause"],
             "status": status, "status_label": db.STATUS_LABELS.get(status), "assignee": r.get("assignee"),
+            "assignee_user_id": r["assignee_user_id"], "assignee_name": r["assignee_name"], "assignee_login": r["assignee_login"],
             "can_confirm_solution": status in db.SOLUTION_CONFIRMATION_STATUSES and not confirmed,
             "confirmed_solution": json.loads(confirmed) if confirmed else None,
             "resolution": r.get("resolution"), "resolved_at": r.get("resolved_at"), "taken_at": r.get("taken_at"),
@@ -253,8 +268,9 @@ def ticket(incident_id: int) -> dict | None:
     return _ticket(rows[0]) if rows else None
 
 
-def tickets(statuses: Optional[list[str]] = None, author: Optional[str] = None, limit: int | None = 100, *, author_user_id=None) -> list[dict]:
-    rows = [_ticket(r) for r in reversed(db.incidents(author_user_id=author_user_id))]
+def tickets(statuses: Optional[list[str]] = None, author: Optional[str] = None, limit: int | None = 100, *,
+            author_user_id: Optional[int] = None, worker_user_id: Optional[int] = None) -> list[dict]:
+    rows = [_ticket(r) for r in reversed(db.incidents(author_user_id=author_user_id, worker_user_id=worker_user_id))]
     if statuses:
         rows = [t for t in rows if t["status"] in statuses]
     if author:
@@ -281,6 +297,15 @@ def ticket_hypotheses(t: dict) -> list[dict]:
     return diagnose._present(diagnose.rule_rank(t["raw_text"], t["failure_type"], hist), "rules")
 
 
+def ticket_repair_history(incident_id: int) -> dict:
+    from . import ticket_plan
+
+    rows = db.incidents(incident_id=incident_id)
+    if not rows:
+        raise ValueError("Запись не найдена в текущем кабинете.")
+    return ticket_plan.repair_history(rows[0])
+
+
 def ticket_recommendation(incident_id: int) -> dict:
     from . import ticket_plan
 
@@ -290,40 +315,70 @@ def ticket_recommendation(incident_id: int) -> dict:
     row = rows[0]
     plan = ticket_plan.for_incident(row)
     primary = plan["hypotheses"][0] if plan["hypotheses"] else plan
+    solution = primary["solution"]
+    if row["status"] != "resolved":
+        history = ticket_plan.repair_history(row)
+        if previous := history["repeat_after_repair"]:
+            date = datetime.fromisoformat(previous["resolved_at"]).strftime("%d.%m.%Y")
+            solution = (f"Сравните условия с заявкой №{previous['id']} и проверьте результат работ, "
+                        f"записанных {date}. {solution}")
+        elif history["entries"]:
+            previous = history["entries"][0]
+            date = datetime.fromisoformat(previous["occurred_at"]).strftime("%d.%m.%Y")
+            solution = f"Сравните обстоятельства события с записью №{previous['id']} от {date}. {solution}"
     return {**plan, "incident_id": incident_id,
             "version": (row["status"], row["taken_at"], row["cause"], row["resolution"]),
-            "proposed_solution": {"title": primary.get("title"), "solution": primary["solution"],
+            "proposed_solution": {"title": primary.get("title"), "solution": solution,
                                   "verify": primary["verify"], "checks": primary.get("checks", plan["steps"]),
                                   "mode": plan["mode"]}}
 
 
-def confirm_ticket_solution(incident_id: int, user_id: int, proposal: dict) -> None:
+def confirm_ticket_solution(incident_id: int, user_id: int, proposal: dict, *,
+                            assignee_user_id: Optional[int] = None) -> None:
     """Confirm the server-generated proposal displayed for this task."""
     if proposal["incident_id"] != incident_id:
         raise ValueError("Это решение подготовлено для другой задачи. Откройте карточку заново.")
-    db.confirm_solution(incident_id, user_id, proposal["version"], proposal["proposed_solution"])
+    db.confirm_solution(incident_id, user_id, proposal["version"], proposal["proposed_solution"],
+                        assignee_user_id=assignee_user_id)
 
 
-def approve_ticket(incident_id: int, admin: str, *, expected_status=None) -> None:
+def approve_ticket(incident_id: int, admin: str, *, expected_status=None,
+                   assignee_user_id: Optional[int] = None, actor_user_id: Optional[int] = None) -> None:
     """Администратор одобряет: заявку решают сотрудники с подсказками ИИ."""
-    db.set_status(incident_id, "approved", who=admin, expected_status=expected_status)
+    db.set_status(incident_id, "approved", who=admin, expected_status=expected_status,
+                  assignee_user_id=assignee_user_id, actor_user_id=actor_user_id)
 
 
-def escalate_ticket(incident_id: int, who: str, note: str, *, expected_status=None) -> None:
+def assign_ticket(incident_id: int, actor_user_id: int, assignee_user_id: int, *,
+                  expected_assignee_user_id: Optional[int]) -> None:
+    """Assign an existing task that is already in work."""
+    db.assign_ticket(incident_id, actor_user_id, assignee_user_id, expected_assignee_user_id=expected_assignee_user_id)
+
+
+def resume_ticket(incident_id: int, actor_user_id: int, *, expected_status: str = "escalated") -> None:
+    """Resume work after an administrator handles the request for help."""
+    db.resume_ticket(incident_id, actor_user_id, expected_status=expected_status)
+
+
+def escalate_ticket(incident_id: int, who: str, note: str, *, expected_status=None,
+                    actor_user_id: Optional[int] = None) -> None:
     """Сотрудникам не хватает сил — передать администратору (запчасти, деньги, подрядчик)."""
     if not (note or "").strip():
         raise ValueError("Напишите, чего не хватает: запчасти, инструмента, знаний — администратору будет проще решить.")
-    db.set_status(incident_id, "escalated", who=who, note=note.strip(), expected_status=expected_status)
+    db.set_status(incident_id, "escalated", who=who, note=note.strip(), expected_status=expected_status,
+                  actor_user_id=actor_user_id)
 
 
-def resolve_ticket(incident_id: int, who: str, resolution: str, cause: Optional[str] = None, *, expected_status=None) -> None:
+def resolve_ticket(incident_id: int, who: str, resolution: str, cause: Optional[str] = None, *,
+                   expected_status=None, actor_user_id: Optional[int] = None) -> None:
     if not (resolution or "").strip():
         raise ValueError("Опишите, что сделали, — это попадёт в историю станка.")
-    db.set_status(incident_id, "resolved", who=who, resolution=resolution.strip(), cause=(cause or None), expected_status=expected_status)
+    db.set_status(incident_id, "resolved", who=who, resolution=resolution.strip(), cause=(cause or None),
+                  expected_status=expected_status, actor_user_id=actor_user_id)
 
 
-def reopen_ticket(incident_id: int, *, expected_status=None) -> None:
-    db.set_status(incident_id, "new", expected_status=expected_status)
+def reopen_ticket(incident_id: int, *, expected_status=None, actor_user_id: Optional[int] = None) -> None:
+    db.set_status(incident_id, "new", expected_status=expected_status, actor_user_id=actor_user_id)
 
 
 # ---------- компании и сотрудники ----------

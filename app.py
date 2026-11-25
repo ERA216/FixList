@@ -3,6 +3,7 @@ import streamlit as st
 import html
 import math
 import time
+from datetime import date
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -10,7 +11,7 @@ from backend import service
 from backend.schemas import MAX_DOWNTIME_MIN, kzt, loss_label
 from ui.theme import apply_theme, card, deck, heading
 from ui.charts import activity_chart, downtime_chart
-from ui import archive_workspace, assistant_chat, money_scenario, sessions, ticket_plan, workspace_data
+from ui import archive_workspace, assistant_chat, money_scenario, report_parts, sessions, ticket_assignment, ticket_history, ticket_plan, workspace_data
 
 st.set_page_config(page_title="FixList · обходы, проблемы, решения", page_icon=str(Path(__file__).resolve().parent / "assets" / "favicon.png"), layout="wide")
 apply_theme()
@@ -24,7 +25,7 @@ def _boot(data_revision):
     return True
 
 
-_boot("ticket-solution-confirmation-v1")
+_boot("ticket-assignment-v1")
 
 EXAMPLES = {
     "Станок №3 · ремень (повторяется)": "Линия 2, станок №3 встал в 14:10, порвался ремень. Поставили новый, простой 1,5 часа. Причину пока не установили.",
@@ -56,6 +57,8 @@ ISSUE_TEXT = {
     "downtime": "Длительность простоя не подтверждена текстом — укажите вручную.",
     "downtime_unverified": "ИИ назвал длительность, которой нет в тексте, — значение отброшено.",
     "cause_removed": "ИИ предложил причину, которой нет в тексте, — она удалена.",
+    "action_unverified": "Действие из черновика требует подтверждения. Укажите, что сделали.",
+    "parts_unverified": "Часть предложенных запчастей или их количество требуют подтверждения. Проверьте список.",
     "low_confidence": "Низкая уверенность — проверьте поля.",
     "type_from_history": "Симптомы в тексте не описаны — тип поломки подставлен по истории этого станка. Проверьте.",
 }
@@ -343,6 +346,7 @@ def review(raw):
     st.subheader("Проверьте перед сохранением")
     eq_ids = [e["id"] for e in EQUIPMENT]
     edited = []
+    valid_parts = True
     for i, d in enumerate(a["drafts"]):
         draft_key = f"{ss['analysis_id']}_{i}"
         with st.container(border=True):
@@ -364,12 +368,13 @@ def review(raw):
             ss.setdefault(ckey, d.get("cause") or "")
             cause = c4.text_input("Причина (подтверждает мастер)", placeholder="Не установлена — выберите гипотезу ниже или впишите", key=ckey)
             action = c5.text_input("Что сделали", value=d.get("action") or "", key=f"act_{draft_key}")
-            parts = ", ".join(f"{p['name']} × {p['qty']}" for p in d.get("parts", [])) or "нет"
-            st.caption(f"Запчасти: {parts} · стоимость не указана" if d["parts_cost_kzt"] is None else f"Запчасти: {parts} · стоимость по справочнику: {kzt(d['parts_cost_kzt'])} ₸")
+            parts, parts_cost, parts_valid = report_parts.edit(d, draft_key)
+            valid_parts = valid_parts and parts_valid
             render_hypotheses(d, ckey)
             edited.append({**d, "equipment_id": eq, "failure_type": ft, "downtime_min": None if ("downtime" in d["issues"] and mins == 0) else mins,
-                           "cause": cause or None, "action": action or None})
-    if st.button("Подтвердить и сохранить", type="primary", disabled=not current) and current:
+                           "cause": cause or None, "action": action or None, "parts": parts,
+                           "parts_cost_kzt": parts_cost, "parts_cost_known": parts_cost is not None})
+    if st.button("Подтвердить и сохранить", type="primary", disabled=not current or not valid_parts) and current and valid_parts:
         try:
             res = service.save_record(a["raw"], edited, a["mode"], author_user_id=USER["id"])
             ss.saved_signals = res["signals"]
@@ -438,7 +443,7 @@ def page_brief():
         with c[3]:
             card("В базе записей", str(sm["total_logs"]), f"История с {sm['history_since']}")
 
-    key = (sm["total_logs"], service.status()["ai_enabled"])
+    key = (date.today(), sm["total_logs"], service.status()["ai_enabled"])
     if ss.get("brief_key") != key or st.button("Обновить сводку"):
         with st.spinner("ИИ готовит сводку по данным из базы…"):
             ss.brief, ss.brief_key = service.daily_brief(), key
@@ -484,9 +489,11 @@ def ticket_card(t):
     import html as _h
     text = _h.escape(t["raw_text"].replace("ДЕМО · ", ""))
     elapsed = archive_workspace.duration(t["source_record"]["duration_seconds"]) if t.get("source_record") else f'{t["downtime_min"]} мин'
+    assignee = ticket_assignment.label(t)
+    executor = f"<br>Исполнитель · {_h.escape(assignee)}" if assignee else ""
     st.markdown(f'''<div class="tcard {STATUS_CLASS[t["status"]]}"><div class="tc-top">{_h.escape(t["status_label"])}</div>
         <div class="tc-title">{_h.escape(t["equipment_name"])}</div><div class="tc-text">{text}</div>
-        <div class="tc-foot">{_h.escape(t["failure_label"])} · {elapsed} · {t["time"][5:]}</div></div>''', unsafe_allow_html=True)
+        <div class="tc-foot">{_h.escape(t["failure_label"])} · {elapsed} · {t["time"][5:]}{executor}</div></div>''', unsafe_allow_html=True)
 
 
 def ai_hints(t):
@@ -500,7 +507,7 @@ def ai_hints(t):
     return hyps
 
 
-def resolve_form(t, hyps, who, key):
+def resolve_form(t, hyps, user, key):
     opts = ["Не установлена"] + [h["title"] for h in hyps] + ["Другая"]
     cause = st.selectbox("Причина", opts, key=f"cause_sel_{key}")
     if cause == "Другая":
@@ -508,7 +515,8 @@ def resolve_form(t, hyps, who, key):
     done = st.text_input("Что сделали", placeholder="Например: заменили ремень, отрегулировали натяжитель", key=f"done_{key}")
     if st.button("Решено", key=f"close_{key}", type="primary"):
         try:
-            service.resolve_ticket(t["id"], who, done, None if cause == "Не установлена" else cause, expected_status=t["status"])
+            service.resolve_ticket(t["id"], user["display_name"], done, None if cause == "Не установлена" else cause,
+                                   expected_status=t["status"], actor_user_id=user["id"])
             st.rerun()
         except ValueError as e:
             st.error(str(e))
@@ -516,12 +524,19 @@ def resolve_form(t, hyps, who, key):
 
 # ---------------- сотрудник: мои задачи ----------------
 def page_tasks():
-    heading("03 / Мои задачи", "Поручено — значит,\nможно решать.", "Задачи, которые одобрил администратор. ИИ подсказывает причины и проверки. Если сил не хватает — одна кнопка, и задача уходит администратору.")
-    tasks = service.tickets(["approved"])
+    heading("03 / Мои задачи", "Поручено — значит,\nможно решать.", "Здесь задачи, назначенные вам, и заявки из общей очереди.")
+    tasks = service.tickets(["approved"], limit=None, worker_user_id=USER["id"])
+    tasks.sort(key=lambda task: task["assignee_user_id"] == USER["id"], reverse=True)
     st.subheader(f"Задачи к решению · {len(tasks)}")
     if not tasks:
         st.info("Одобренных задач нет. Новые появятся, когда администратор одобрит заявку.")
-    for t in tasks:
+    page_size = 12
+    pages = max(1, math.ceil(len(tasks) / page_size))
+    page_key = "worker-task-page"
+    if ss.get(page_key, 1) > pages:
+        ss[page_key] = pages
+    page = st.number_input("Страница задач", min_value=1, max_value=pages, step=1, key=page_key) if pages > 1 else 1
+    for t in tasks[(page - 1) * page_size:page * page_size]:
         with st.container(border=True):
             a, b = st.columns([1, 1.6], gap="large")
             with a:
@@ -531,13 +546,14 @@ def page_tasks():
                 hyps = ticket_plan.show_confirmed(confirmed) if confirmed else ai_hints(t)
                 tab1, tab2 = st.tabs(["Решили сами", "Нужна помощь администратора"])
                 with tab1:
-                    resolve_form(t, hyps, USER["display_name"], f"w{t['id']}")
+                    resolve_form(t, hyps, USER, f"w{t['id']}")
                 with tab2:
                     note = st.text_area("Чего не хватает?", placeholder="Например: нужна запчасть, которой нет на складе; нужен электрик; нужна закупка",
                                         height=80, key=f"esc_{t['id']}")
                     if st.button("Передать администратору", key=f"escb_{t['id']}"):
                         try:
-                            service.escalate_ticket(t["id"], USER["display_name"], note, expected_status=t["status"])
+                            service.escalate_ticket(t["id"], USER["display_name"], note,
+                                                    expected_status=t["status"], actor_user_id=USER["id"])
                             st.rerun()
                         except ValueError as e:
                             st.error(str(e))
@@ -678,10 +694,10 @@ def page_board():
     heading("01 / Панель задач", "Выберите, что решить\nв первую очередь.", "Добавляйте свои события, открывайте карточки и поручайте проверки сотрудникам.")
     board_data_controls()
     ai_warnings()
-    focused_ticket = ss.pop("ticket-confirmed", None)
+    focused_ticket, work_message = ss.pop(ticket_assignment.WORK_QUEUE_REQUEST, (None, None))
     if focused_ticket:
         ss["company-board-status"] = "approved"
-        st.success("Решение сохранено. Задача в работе.")
+        st.success(work_message)
     cnt = service.ticket_counts()
     labels = {"escalated": f"Нужна помощь · {cnt['escalated']}", "new": f"Ждут одобрения · {cnt['new']}",
               "approved": f"В работе · {cnt['approved']}", "resolved": "Решённые"}
@@ -705,35 +721,37 @@ def page_board():
 
 
 @st.dialog("Событие оборудования", width="large")
-def ticket_detail(incident_id):
+def ticket_detail(incident_id, *, return_to=None):
     user = sessions.require_user()
     service.use_company(user["company_id"])
     t = service.ticket(incident_id)
     if not t:
         st.error("Запись не найдена.")
         return
-    archive_workspace.render_event_details(t)
-    if t["status"] == "escalated":
-        st.warning(f"{t['assignee'] or 'Сотрудник'}: {t['escalation_note']}")
+    archive_workspace.render_event_details(t, user)
+    ticket_assignment.resume(t, user)
     if t["status"] == "resolved":
         st.success(f"Решено: {t['resolution'] or '—'}" + (f" · причина: {t['cause']}" if t["cause"] else "") + (f" · {t['assignee']}" if t["assignee"] else ""))
-        ticket_plan.render(t, user)
+        history = ticket_history.render(t, return_to=return_to)
+        ticket_plan.render(t, user, history)
         return
 
     if st.button("Деньги и экономия по этой поломке", key="to_plan"):
         ss.plan_target = _plan_key(t)
         go("План экономии")
     result_area = st.container()
-    hyps = ticket_plan.render(t, user)
-    who = user["display_name"]
+    history = ticket_history.render(t, return_to=return_to)
+    worker_id = ticket_assignment.select(t, user)
+    hyps = ticket_plan.render(t, user, history, assignee_user_id=worker_id)
     if t["status"] == "new" and st.button("Поручить сотрудникам", type="primary", key="approve", use_container_width=True):
         try:
-            service.approve_ticket(incident_id, who, expected_status=t["status"])
-            st.rerun()
+            service.approve_ticket(incident_id, user["display_name"], expected_status=t["status"],
+                                   assignee_user_id=worker_id, actor_user_id=user["id"])
+            ticket_assignment.open_work_queue(incident_id)
         except ValueError as error:
             st.error(str(error))
     with result_area, st.expander("Записать результат проверки"):
-        resolve_form(t, hyps, who, f"board_{incident_id}")
+        resolve_form(t, hyps, user, f"board_{incident_id}")
 
 
 def board_data_controls():
@@ -938,4 +956,8 @@ if PUBLIC_ARCHIVE:
                   "План экономии": archive_workspace.finance, "История и эффект": archive_workspace.history,
                   "Спросить ИИ": lambda: archive_workspace.ask(can_open_finance="План экономии" in AVAILABLE_PAGES)})
 pages[ss.page]()
+if history_target := ss.pop(ticket_history.OPEN_REQUEST, None):
+    incident_id, return_to = history_target
+    open_ticket = archive_workspace.event_dialog if PUBLIC_ARCHIVE else ticket_detail
+    open_ticket(incident_id, return_to=return_to)
 

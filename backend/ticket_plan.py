@@ -1,9 +1,11 @@
 """Evidence-based actions for one event on the task board."""
+from datetime import datetime, timedelta, timezone
 import json
 import re
+import time
 
 from . import config, db, diagnose, extract, llm, open_data
-from .schemas import BaseModel, Field
+from .schemas import BaseModel, Field, custom_type_key
 
 
 PROMPT = """Выбери причины, для которых предложенные действия лучше всего соответствуют признакам в записи.
@@ -70,6 +72,69 @@ DEFAULT_ARCHIVE_ACTION = (
 
 class CauseSelection(BaseModel):
     cause_ids: list[str] = Field(default_factory=list, max_length=2)
+
+
+def _history_key(row):
+    if source := row["source_record"]:
+        return ("source", row["source_dataset"], source["code"])
+    kind = row["failure_type"]
+    custom_kind = custom_type_key(kind, row["custom_event_type"])
+    if kind == "other" and not custom_kind:
+        return None
+    return ("local", kind, custom_kind)
+
+
+def _utc_time(value, *, archive=False):
+    at = datetime.fromisoformat(value)
+    # The importer stores SCADA times as UTC without the offset. Local logs use local time.
+    if archive and at.tzinfo is None:
+        return at.replace(tzinfo=timezone.utc)
+    try:
+        return at.astimezone(timezone.utc)
+    except OSError:
+        # Windows cannot look up local offsets for some dates before 1970.
+        standard_offset = timezone(timedelta(seconds=-time.timezone))
+        return at.replace(tzinfo=standard_offset).astimezone(timezone.utc)
+
+
+def repair_history(row):
+    """Return prior occurrences and recorded work on the same equipment."""
+    key = _history_key(row)
+    history = {"entries": [], "occurrences_30d": 1, "repeat_after_repair": None}
+    if key is None:
+        return history
+
+    occurred_at = _utc_time(row["occurred_at"], archive=bool(row["source_record"]))
+    period_start = occurred_at - timedelta(days=30)
+    prior = []
+    for candidate in db.incidents(row["equipment_id"]):
+        if candidate["id"] == row["id"] or _history_key(candidate) != key:
+            continue
+        at = _utc_time(candidate["occurred_at"], archive=bool(candidate["source_record"]))
+        if at < occurred_at:
+            prior.append((at, candidate))
+            if at >= period_start:
+                history["occurrences_30d"] += 1
+    prior.sort(key=lambda entry: (entry[0], entry[1]["id"]), reverse=True)
+
+    last_repair = None
+    for at, entry in prior[:3]:
+        resolution, resolved_at = None, None
+        if entry["status"] == "resolved" and entry["resolved_at"] and (entry["resolution"] or "").strip():
+            completed_at = _utc_time(entry["resolved_at"])
+            if at <= completed_at < occurred_at:
+                resolution, resolved_at = entry["resolution"], entry["resolved_at"]
+                if last_repair is None or completed_at > last_repair:
+                    last_repair = completed_at
+                    history["repeat_after_repair"] = {
+                        "id": entry["id"], "resolved_at": resolved_at,
+                        "elapsed_seconds": int((occurred_at - completed_at).total_seconds()),
+                    }
+        history["entries"].append({
+            "id": entry["id"], "occurred_at": entry["occurred_at"],
+            "downtime_min": entry["downtime_min"], "resolution": resolution, "resolved_at": resolved_at,
+        })
+    return history
 
 
 def _positive_signs(text, signs):

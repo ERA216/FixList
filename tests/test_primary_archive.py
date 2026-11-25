@@ -111,7 +111,10 @@ class PrimaryArchiveTests(unittest.TestCase):
         app.run()
         app.button(key=f"archive-open-{record['id']}").click().run()
         self.assertFalse(app.exception)
-        self.assertTrue(any(item.value == "Решение ИИ" for item in app.subheader))
+        headings = [item.value for item in app.subheader]
+        self.assertLess(headings.index("Что делали в прошлый раз"), headings.index("Решение ИИ"))
+        self.assertTrue(any(f"Тот же код {record['source_record']['code']}" in item.value for item in app.caption))
+        self.assertTrue(any("Результат работ на момент этого события не указан" in item.value for item in app.caption))
         self.assertTrue(any(item.value == "**Как проверить результат**" for item in app.markdown))
         self.assertTrue(any(f"Код {record['source_record']['code']}" in item.value for item in app.text))
         self.assertEqual(service.ticket(record["id"])["status"], "archived")
@@ -132,6 +135,61 @@ class PrimaryArchiveTests(unittest.TestCase):
         recommendation = service.ticket_recommendation(pressure["id"])
         self.assertIn("Если сервис подтвердит утечку", recommendation["solution"])
         self.assertIn("давление удерживается в допустимом диапазоне", recommendation["verify"])
+
+    def test_archive_manual_approval_assigns_the_selected_worker(self):
+        from streamlit.testing.v1 import AppTest
+
+        self.install()
+        record = service.tickets(["archived"], limit=1)[0]
+        incident_id = record["id"]
+        worker = service.login("FIXLIST", "master", "2222")
+        service.reopen_ticket(incident_id, expected_status="archived")
+        app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py"), default_timeout=25)
+        app.session_state["user"] = self.admin
+        app.session_state["session-expires-at"] = time() + 3600
+        app.session_state["archive-board-filter"] = "Новые задачи"
+        app.run()
+        app.button(key=f"archive-open-{incident_id}").click().run()
+        app.selectbox(key=f"ticket-assignee-{incident_id}").set_value(worker["id"])
+        app.button(key="archive-approve-task").click()
+        app.button(key=f"archive-open-{incident_id}").click().run()
+        self.assertFalse(app.exception)
+        self.assertEqual(app.radio(key="archive-board-filter").value, "В работе")
+        updated = service.ticket(incident_id)
+        self.assertEqual(updated["assignee_user_id"], worker["id"])
+        self.assertIsNone(updated["confirmed_solution"])
+        self.assertEqual(updated["source_record"], record["source_record"])
+
+    def test_admin_can_see_and_assign_an_active_task_started_without_a_worker(self):
+        from streamlit.testing.v1 import AppTest
+
+        self.install()
+        record = service.tickets(["archived"], limit=1)[0]
+        incident_id = record["id"]
+        service.confirm_ticket_solution(incident_id, self.admin["id"], service.ticket_recommendation(incident_id))
+        active = service.ticket(incident_id)
+        worker = service.login("FIXLIST", "master", "2222")
+
+        app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py"), default_timeout=25)
+        app.session_state["user"] = self.admin
+        app.session_state["session-expires-at"] = time() + 3600
+        app.session_state["archive-board-filter"] = "В работе"
+        app.run()
+        self.assertTrue(any("Исполнитель" in item.value and "Не назначен" in item.value for item in app.markdown))
+        app.button(key=f"archive-open-{incident_id}").click().run()
+        self.assertTrue(any(item.label == "Назначить исполнителя" for item in app.expander))
+        app.selectbox(key=f"ticket-edit-assignee-{incident_id}-0").set_value(worker["id"])
+        next(button for button in app.button if button.label == "Сохранить исполнителя").click()
+        app.button(key=f"archive-open-{incident_id}").click().run()
+
+        self.assertFalse(app.exception)
+        self.assertTrue(any(item.value == "Исполнитель сохранён." for item in app.success))
+        self.assertTrue(any(f"{worker['display_name']} · {worker['login']}" in item.value for item in app.markdown))
+        assigned = service.ticket(incident_id)
+        self.assertEqual(assigned["status"], "approved")
+        self.assertEqual(assigned["assignee_user_id"], worker["id"])
+        self.assertEqual(assigned["confirmed_solution"], active["confirmed_solution"])
+        self.assertEqual(assigned["taken_at"], active["taken_at"])
 
     def test_chat_reports_unknown_cost_and_future_failure_honestly(self):
         self.install()

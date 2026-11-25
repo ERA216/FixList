@@ -105,14 +105,25 @@ class WorkspaceDataTests(unittest.TestCase):
         account = service.start_workspace("Мастерская", "Компрессор", "C-01")
         company, admin = account["company"], account["admin"]
         service.use_company(company["id"])
+        worker, colleague = service.add_workers(company["id"], "Сотрудник\nСотрудник")
+        now = datetime.now()
+        previous = service.add_workspace_event(admin["id"], account["equipment_id"], "Был перегрев.",
+                                               now - timedelta(days=8), "overheating", 25)
+        with patch("backend.db.now_iso", return_value=(now - timedelta(days=7)).isoformat(timespec="seconds")):
+            service.resolve_ticket(previous, admin["display_name"], "Сверили показания температуры по журналу.")
         incident = service.add_workspace_event(admin["id"], account["equipment_id"], "Перегрев. На радиаторе много пыли.",
-                                                datetime.now(), "overheating")
+                                                now, "overheating")
         app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py"), default_timeout=25)
         app.session_state["user"] = service.login(company["code"], admin["login"], admin["pin"])
         app.session_state["session-expires-at"] = time() + 3600
         app.run()
         app.button(key=f"archive-open-{incident}").click().run()
         self.assertFalse(app.exception)
+        headings = [item.value for item in app.subheader]
+        self.assertLess(headings.index("Что делали в прошлый раз"), headings.index("Решение ИИ"))
+        self.assertTrue(any("Сверили показания температуры" in item.value for item in app.text))
+        self.assertIn(f"Открыть заявку №{previous}", app.button(key=f"ticket-history-link-{incident}-{previous}").label)
+        self.assertTrue(any("Повтор через 7 дн." in item.value for item in app.markdown))
         self.assertFalse(any(item.label == "Предложить решение с ИИ" for item in app.button))
         self.assertTrue(any("Загрязнение радиатора и вентиляции" in item.value for item in app.markdown))
         self.assertTrue(any("очистку радиатора" in item.value for item in app.markdown))
@@ -125,6 +136,7 @@ class WorkspaceDataTests(unittest.TestCase):
         self.assertIsNone(service.ticket(incident)["confirmed_solution"])
 
         # AppTest runs the full page, so also trigger the dialog for its widget events.
+        app.selectbox(key=f"ticket-assignee-{incident}").set_value(worker["id"])
         next(button for button in app.button if button.label == "Решить с ИИ").click()
         app.button(key=f"archive-open-{incident}").click().run()
         self.assertFalse(app.exception)
@@ -132,10 +144,11 @@ class WorkspaceDataTests(unittest.TestCase):
         service.use_company(company["id"])
         ticket = service.ticket(incident)
         self.assertEqual(ticket["status"], "approved")
+        self.assertEqual(ticket["assignee_user_id"], worker["id"])
         self.assertIsNone(ticket["resolution"])
         self.assertIn("очистку радиатора", ticket["confirmed_solution"]["solution"])
+        self.assertTrue(any(f"Сотрудник · {worker['login']}" in item.value for item in app.markdown))
 
-        worker = service.add_workers(company["id"], "Сотрудник")[0]
         worker_app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py"), default_timeout=25)
         worker_app.session_state["user"] = service.login(company["code"], worker["login"], worker["pin"])
         worker_app.session_state["session-expires-at"] = time() + 3600
@@ -144,6 +157,11 @@ class WorkspaceDataTests(unittest.TestCase):
         self.assertFalse(worker_app.exception)
         self.assertTrue(any(item.value == "Подтверждённое решение" for item in worker_app.subheader))
         self.assertTrue(any("очистку радиатора" in item.value for item in worker_app.markdown))
+
+        worker_app.session_state["user"] = service.login(company["code"], colleague["login"], colleague["pin"])
+        worker_app.run()
+        self.assertFalse(worker_app.exception)
+        self.assertFalse(any(item.key == f"close_w{incident}" for item in worker_app.button))
 
         app.button(key=f"archive-open-{incident}").click().run()
         self.assertFalse(app.exception)

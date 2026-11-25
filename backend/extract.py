@@ -9,7 +9,7 @@ import re
 from datetime import date
 from typing import Optional
 
-from . import config, db, diagnose, llm
+from . import config, db, diagnose, llm, report_evidence
 from .assistant_scope import CODE_TOKEN_RE
 from .schemas import FAILURE_LABELS, MAX_DOWNTIME_MIN, ExtractionResult, FailureType
 
@@ -23,8 +23,6 @@ FAILURE_KEYWORDS = {
     "overheating": ["перегр", "греет", "горяч", "қызып", "қызды"],
     "material": ["сырь", "материал", "заготов", "шикізат"],
 }
-PART_KEYWORDS = {"ремень": ["ремен", "ремн", "белдік"], "датчик": ["датчик"], "подшипник": ["подшип"], "предохранитель": ["предохран"], "контактор": ["контактор"], "сальник": ["сальник"]}
-REPLACE_WORDS = ["замен", "поставили нов", "поменял", "ауыстыр"]
 ORDINALS = {"перв": 1, "втор": 2, "трет": 3, "четверт": 4, "пят": 5, "шест": 6}
 
 SYSTEM_PROMPT = """Ты извлекаешь инциденты оборудования из отчёта мастера смены небольшого производства.
@@ -35,9 +33,10 @@ SYSTEM_PROMPT = """Ты извлекаешь инциденты оборудов
 2. failure_type — одно значение из списка типов.
 3. downtime_min — простой в минутах целым числом («1,5 часа» = 90, «полчаса» = 30). Если длительность не указана — null.
 4. downtime_quote — ДОСЛОВНЫЙ фрагмент отчёта, подтверждающий длительность именно этого объекта. Если привязка неясна — null.
-5. cause — только если причина прямо названа в тексте («из-за пыли», «потому что…»). Не придумывай. Иначе null.
+5. cause — дословно после явного объяснения причины («из-за пыли», «потому что…»). Иначе null.
    Вероятные причины отдельно подберёт модуль диагностики.
-6. action — что сделали, по тексту. parts — заменённые детали.
+6. action — дословная фраза о выполненной работе на этом оборудовании. parts — явно заменённые детали.
+   Не включай плановые или отрицаемые работы. Не додумывай количество деталей.
 7. confidence — 0..1, насколько уверен в полях этого инцидента.
 8. Ничего не выдумывай: числа, детали и причины — только из текста.
 
@@ -49,25 +48,45 @@ SYSTEM_PROMPT = """Ты извлекаешь инциденты оборудов
 
 # ---------- разбор длительностей (используется и для проверки ответа ИИ) ----------
 
+_MINUTE_UNIT = r"(?:мин(?:ут[ауы]?)?|м)\b"
 _DUR_RE = re.compile(
-    r"(?P<num>\d+(?:[.,]\d+)?)\s*(?P<unit>час(?:а|ов)?\b|ч\b|сағ(?:ат)?\b|мин(?:ут[ауы]?)?\b|м\b)"
+    r"(?P<num>\d+(?:[.,]\d+)?)\s*(?P<unit>"
+    rf"(?:час(?:а|ов)?|ч|сағ(?:ат)?)(?:\b|(?=\d+\s*{_MINUTE_UNIT}))|{_MINUTE_UNIT})"
     r"|(?P<half>полчаса|жарты сағат)"
     r"|(?P<hourword>(?<![\d,.]\s)(?<!\d)час\b)",
     re.I,
 )
 _NO_DOWNTIME = re.compile(r"\b(?:простоя\s+не\s+было|без\s+простоя|нет\s+простоя|простоя\s+нет|не\s+простаива\w*)\b", re.I)
 _DOWNTIME_CONTEXT = re.compile(r"\b(?:просто[йяеию]\w*|простаива\w*|стоял\w*|останов\w*|тұрды)\b", re.I)
-_OTHER_ACTIVITY = re.compile(r"\b(?:осмотр\w*|обход\w*|проверк\w*|проверял\w*|диагностик\w*|ремонт\w*|наладк\w*)\b", re.I)
+_OTHER_ACTIVITY = re.compile(r"\b(?:осмотр\w*|обход\w*|проверк\w*|проверял\w*|проверил\w*|диагностик\w*|ремонт\w*|наладк\w*)\b", re.I)
 _CLAUSE_SPLIT = re.compile(r"[;\n!?]|,(?!\d)|\.(?!\d)|(?<!\d)[,.]")
+_SIGNAL_CODE_PREFIX = re.compile(
+    r"\b(?:ошибк\w*|авари\w*|сигнал\w*|предупреждени\w*)\s*(?:код\w*\s*)?[\s:=#№«\"'(–—-]*$",
+    re.I,
+)
+
+
+def _mask_codes(text):
+    def mask(match):
+        token = match[0].rstrip(".")
+        if any(char.isdecimal() for char in token):
+            return " " * len(token) + match[0][len(token):]
+        return match[0]
+
+    return CODE_TOKEN_RE.sub(mask, text)
 
 
 def parse_durations(text: str) -> list[tuple[int, str]]:
     explicit, fallback = [], []
-    for clause in _CLAUSE_SPLIT.split(text):
+    # Match against a length-preserving copy so identifiers cannot become durations.
+    masked = _mask_codes(text)
+    boundaries = [0, *(separator.end() for separator in _CLAUSE_SPLIT.finditer(masked)), len(text)]
+    for left, right in zip(boundaries, boundaries[1:]):
+        clause, normalized_clause = text[left:right], masked[left:right]
         if negated := _NO_DOWNTIME.search(clause):
             explicit.append((0, negated[0]))
             continue
-        tokens = list(_DUR_RE.finditer(clause))
+        tokens = list(_DUR_RE.finditer(normalized_clause))
         index = 0
         while index < len(tokens):
             token = tokens[index]
@@ -92,8 +111,9 @@ def parse_durations(text: str) -> list[tuple[int, str]]:
             # The nearest preceding activity indicates what the duration describes.
             downtime = list(_DOWNTIME_CONTEXT.finditer(clause, 0, token.start()))
             other = list(_OTHER_ACTIVITY.finditer(clause, 0, token.start()))
-            downtime_suffix = re.match(r"\s+просто[йяеию]\b", clause[end:], re.I)
-            if not downtime_suffix and other and (not downtime or other[-1].end() > downtime[-1].end()):
+            after = clause[end:].lstrip()
+            downtime_suffix = _DOWNTIME_CONTEXT.match(after)
+            if _OTHER_ACTIVITY.match(after) or (not downtime_suffix and other and (not downtime or other[-1].end() > downtime[-1].end())):
                 continue
             candidate = (round(minutes), clause[token.start():end])
             (explicit if downtime or downtime_suffix else fallback).append(candidate)
@@ -106,16 +126,20 @@ def _norm(s: str) -> str:
 
 def _equipment_matches(text: str, eq: dict) -> tuple[set[str], bool]:
     t = _norm(text)
+    tokens = [m for m in CODE_TOKEN_RE.finditer(t) if any(char.isdecimal() for char in m[0])]
+    signal_codes = {m.start() for m in tokens if _SIGNAL_CODE_PREFIX.search(t, 0, m.start())}
     mentions = set()
     for e in eq.values():
         code = re.escape(_norm(e.get("code") or e["id"]))
         mentions.update((m.start(), m.end(), True, e["id"])
-                        for m in re.finditer(r"(?<![\w.-])" + code + r"(?![\w-]|\.\w)", t))
+                        for m in re.finditer(r"(?<![\w.-])" + code + r"(?![\w-]|\.\w)", t)
+                        if m.start() not in signal_codes)
         for alias in map(_norm, e["aliases"]):
             if alias:
                 suffix = r"(?!\w)" if len(alias) <= 2 or alias[-1].isdigit() else ""
                 mentions.update((m.start(), m.end(), False, e["id"])
-                                for m in re.finditer(r"(?<!\w)" + re.escape(alias) + suffix, t))
+                                for m in re.finditer(r"(?<!\w)" + re.escape(alias) + suffix, t)
+                                if m.start() not in signal_codes)
     patterns = [r"(?:станок|станка|станке|станку|станоктың|станокта|ст\.)\s*(?:№|n|#|номер)?\s*(\d+)",
                 r"(?:№|#)\s*(\d+)\s*станок", r"(\d+)\s*[-–]?\s*(?:й|ий|ый|ой)?\s*станок"]
     for pat in patterns:
@@ -140,10 +164,10 @@ def _equipment_matches(text: str, eq: dict) -> tuple[set[str], bool]:
                   or (right <= start and re.fullmatch(r"[\s()·—–]*", t[right:start]))}
         matches.update(options & nearby or options)
     unmatched_code = False
-    for match in CODE_TOKEN_RE.finditer(t):
-        token = match[0].rstrip(".")
-        if not any(char.isdecimal() for char in token):
+    for match in tokens:
+        if match.start() in signal_codes:
             continue
+        token = match[0].rstrip(".")
         if not any(left <= match.start() and right >= match.start() + len(token) for left, right, _, _ in mentions):
             unmatched_code = True
             break
@@ -189,16 +213,15 @@ def rule_based(raw: str) -> ExtractionResult:
         durs = parse_durations(t)
         if not equipment_id and not durs and detect_failure(t) == "other":
             continue  # нет ни станка, ни поломки, ни простоя — это не инцидент
-        parts = [{"name": name, "qty": 1} for name, words in PART_KEYWORDS.items()
-                 if any(w in _norm(t) for w in words) and any(w in _norm(t) for w in REPLACE_WORDS)]
+        facts = report_evidence.clauses([t]) if equipment_id else []
         out.append({
             "equipment_id": equipment_id,
             "failure_type": detect_failure(t),
             "downtime_min": durs[0][0] if durs else None,
             "downtime_quote": durs[0][1] if durs else None,
-            "parts": parts,
+            "parts": report_evidence.suggested_parts(facts),
             "cause": None,
-            "action": "замена детали" if parts else None,
+            "action": report_evidence.first_action(facts),
             "confidence": 0.6,
         })
     if not out:
@@ -210,14 +233,17 @@ def rule_based(raw: str) -> ExtractionResult:
 
 def validate(raw: str, result: ExtractionResult) -> tuple[list[dict], list[str]]:
     eq_map = db.equipment_map()
-    raw_n = _norm(raw)
     durations = defaultdict(list)
+    evidence = defaultdict(list)
     identified = set()
-    for matches, unknown, text in _incident_segments(raw, eq_map):
+    segments = _incident_segments(raw, eq_map)
+    for matches, unknown, text in segments:
         identified.update(matches)
         if not matches or (len(matches) == 1 and not unknown):
             equipment_id = next(iter(matches), None)
             durations[equipment_id].extend(parse_durations(text))
+            if equipment_id is not None:
+                evidence[equipment_id].append(text)
     drafts, questions = [], list(result.needs_clarification)
     for inc in result.incidents:
         d = inc.model_dump(mode="json")
@@ -242,12 +268,17 @@ def validate(raw: str, result: ExtractionResult) -> tuple[list[dict], list[str]]
             d["downtime_min"] = d["downtime_quote"] = None
             issues.append("downtime")
             questions.append("Сколько минут длился простой? В тексте не нашлось подтверждения для этого оборудования.")
-        # 3. Причина не должна быть выдумана: хотя бы одно слово причины есть в тексте
-        if d.get("cause"):
-            words = [w for w in re.findall(r"\w{4,}", _norm(d["cause"]))]
-            if words and not any(w[:5] in raw_n for w in words):
-                d["cause"] = None
-                issues.append("cause_removed")
+        facts = report_evidence.clauses(evidence[d["equipment_id"]])
+        if d["cause"] and not report_evidence.confirmed_cause(d["cause"], facts):
+            d["cause"] = None
+            issues.append("cause_removed")
+        if d["action"] and not report_evidence.confirmed_action(d["action"], facts):
+            d["action"] = None
+            issues.append("action_unverified")
+        parts = report_evidence.confirmed_parts(d["parts"], facts)
+        if len(parts) != len(d["parts"]):
+            issues.append("parts_unverified")
+        d["parts"] = parts
         # 3б. Тип поломки не назван — подставляем самый частый по истории станка (мастер подтверждает)
         if not db.source_profile() and d["failure_type"] == "other" and d["equipment_id"] and detect_failure(raw) == "other":
             today = date.today().isoformat()
@@ -263,7 +294,8 @@ def validate(raw: str, result: ExtractionResult) -> tuple[list[dict], list[str]]
         d["needs_review"] = bool(d["issues"])
         d["failure_label"] = FAILURE_LABELS.get(d["failure_type"], d["failure_type"])
         d["equipment_name"] = eq_map[d["equipment_id"]]["name"] if d["equipment_id"] else None
-        d["parts_cost_kzt"] = None if db.source_profile() else sum(db.part_price(p["name"]) * p["qty"] for p in d.get("parts", []))
+        prices = [db.part_price(part["name"]) * part["qty"] for part in parts]
+        d["parts_cost_kzt"] = None if db.source_profile() or "parts_unverified" in issues or 0 in prices else sum(prices)
         drafts.append(d)
     return drafts, list(dict.fromkeys(questions))
 

@@ -9,7 +9,7 @@ import streamlit as st
 
 from backend import service
 from backend.schemas import num
-from ui import assistant_chat, money_scenario, sessions, ticket_plan
+from ui import assistant_chat, money_scenario, sessions, ticket_assignment, ticket_history, ticket_plan
 from ui.charts import _render
 from ui.open_data import _kelmarsh, _maintie, _sources, duration, interval_label, number, timestamp
 from ui.theme import card, heading
@@ -75,6 +75,9 @@ def _event_card(row, open_event):
     text = " ".join(row["raw_text"].split())
     label = row["failure_label"] if source or row["custom_event_type"] else text[:150] + ("…" if len(text) > 150 else "")
     origin = "SCADA · Код " + source["code"] if source else ("CSV" if row["source_id"] else "FIXLIST")
+    assignment = ""
+    if name := ticket_assignment.label(row):
+        assignment = f'<div><span>Исполнитель</span><strong>{html.escape(name)}</strong></div>'
     with st.container(key=f'archive-card-{row["id"]}'):
         st.markdown(
             f'<article class="archive-ticket archive-state-{state}">'
@@ -84,7 +87,7 @@ def _event_card(row, open_event):
             f'<p class="archive-ticket-description">{html.escape(label)}</p>'
             '<div class="archive-ticket-facts"><div><span>Длительность остановки</span>'
             f'<strong>{html.escape(elapsed)}</strong></div><div><span>{"Начало · UTC" if source else "Дата записи"}</span>'
-            f'<strong>{started:%d.%m.%Y} · {started:%H:%M:%S}</strong></div></div>'
+            f'<strong>{started:%d.%m.%Y} · {started:%H:%M:%S}</strong></div>{assignment}</div>'
             + _event_money(row, compact=True) + '</article>', unsafe_allow_html=True)
         if st.button("Открыть карточку →", key=f'archive-open-{row["id"]}', use_container_width=True):
             open_event(row["id"])
@@ -99,7 +102,7 @@ def event_grid(rows, open_event):
                     _event_card(row, open_event)
 
 
-def render_event_details(row):
+def render_event_details(row, user):
     source = row["source_record"]
     origin = "АРХИВ 2016" if source else ("CSV" if row["source_id"] else "FIXLIST")
     st.markdown(f'<div class="archive-detail-header"><span>СОБЫТИЕ ОБОРУДОВАНИЯ · {origin}</span>'
@@ -111,7 +114,10 @@ def render_event_details(row):
         reference = ("Номер события в CSV", row["source_id"]) if row["source_id"] else ("Кто внёс", row["author"] or "—")
         facts = [("Дата и время", timestamp(row["occurred_at"])), ("Длительность", duration(row["downtime_min"] * 60)),
                  ("Статус", row["status_label"]), reference]
+    if name := ticket_assignment.label(row):
+        facts.append(("Исполнитель", name))
     st.markdown('<dl class="archive-detail-facts">' + "".join(f'<div><dt>{html.escape(name)}</dt><dd>{html.escape(value)}</dd></div>' for name, value in facts) + '</dl>', unsafe_allow_html=True)
+    ticket_assignment.edit_active(row, user)
     st.markdown(_event_money(row), unsafe_allow_html=True)
     if source:
         st.caption("Состояние ремонта и расходы в источнике не указаны. Результат проверки можно добавить в FixList.")
@@ -125,30 +131,34 @@ def render_event_details(row):
 
 
 @st.dialog("Событие оборудования", width="large")
-def event_dialog(incident_id):
+def event_dialog(incident_id, *, return_to=None):
     user = sessions.require_user()
     service.use_company(user["company_id"])
     record = service.ticket(incident_id)
     if not record:
         st.error("Запись не найдена.")
         return
-    render_event_details(record)
+    render_event_details(record, user)
+    ticket_assignment.resume(record, user)
     status = record["status"]
     if status == "new":
         st.caption("Задача создана в FixList для проверки архивного сигнала.")
-    ticket_plan.render(record, user)
+    history = ticket_history.render(record, return_to=return_to)
+    worker_id = ticket_assignment.select(record, user)
+    ticket_plan.render(record, user, history, assignee_user_id=worker_id)
     if status == "archived":
         if st.button("Создать задачу по проверке сигнала", type="primary", key="archive-create-task", use_container_width=True):
             try:
-                service.reopen_ticket(incident_id, expected_status=status)
+                service.reopen_ticket(incident_id, expected_status=status, actor_user_id=user["id"])
                 st.rerun()
             except ValueError as error:
                 st.error(str(error))
     elif status == "new":
         if st.button("Поручить проверку сотрудникам", type="primary", key="archive-approve-task", use_container_width=True):
             try:
-                service.approve_ticket(incident_id, user["display_name"], expected_status=status)
-                st.rerun()
+                service.approve_ticket(incident_id, user["display_name"], expected_status=status,
+                                       assignee_user_id=worker_id, actor_user_id=user["id"])
+                ticket_assignment.open_work_queue(incident_id)
             except ValueError as error:
                 st.error(str(error))
     elif status in ("approved", "escalated"):
@@ -156,7 +166,8 @@ def event_dialog(incident_id):
         resolution = st.text_area("Что проверили и что установили", key="archive-resolution")
         if st.button("Сохранить результат проверки", type="primary", key="archive-resolve-task"):
             try:
-                service.resolve_ticket(incident_id, user["display_name"], resolution, expected_status=status)
+                service.resolve_ticket(incident_id, user["display_name"], resolution, expected_status=status,
+                                       actor_user_id=user["id"])
                 st.rerun()
             except ValueError as error:
                 st.error(str(error))
@@ -168,11 +179,11 @@ def event_dialog(incident_id):
 def board(add_data):
     heading("01 / Панель задач", "Сигналы записаны.\nПроверки под контролем.", "Реальные остановки оборудования Kelmarsh. Откройте исходное событие и создайте задачу по его проверке.")
     add_data()
-    focused_ticket = st.session_state.pop("ticket-confirmed", None)
+    focused_ticket, work_message = st.session_state.pop(ticket_assignment.WORK_QUEUE_REQUEST, (None, None))
     if focused_ticket:
         st.session_state["archive-board-filter"] = "В работе"
         st.session_state["archive-board-search"] = ""
-        st.success("Решение сохранено. Задача в работе.")
+        st.success(work_message)
     counts = service.ticket_counts()
     _metrics([("Событий в архиве", len(service.archive_report()["rows"]), "Исходные записи Kelmarsh"),
               ("Новых задач", counts["new"], "Проверки, созданные в FixList"),
