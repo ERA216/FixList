@@ -191,6 +191,37 @@ class PrimaryArchiveTests(unittest.TestCase):
         self.assertEqual(assigned["confirmed_solution"], active["confirmed_solution"])
         self.assertEqual(assigned["taken_at"], active["taken_at"])
 
+    def test_help_requests_are_available_under_in_progress(self):
+        from streamlit.testing.v1 import AppTest
+
+        self.install()
+        incident_id = service.tickets(["archived"], limit=1)[0]["id"]
+        worker = service.login("FIXLIST", "master", "2222")
+        service.reopen_ticket(incident_id, expected_status="archived", actor_user_id=self.admin["id"])
+        service.approve_ticket(incident_id, self.admin["display_name"], expected_status="new",
+                               assignee_user_id=worker["id"], actor_user_id=self.admin["id"])
+        service.escalate_ticket(incident_id, worker["display_name"], "Ждём запчасть",
+                                expected_status="approved", actor_user_id=worker["id"])
+
+        app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py"), default_timeout=25)
+        app.session_state["user"] = self.admin
+        app.session_state["session-expires-at"] = time() + 3600
+        app.session_state["archive-board-filter"] = "Нужна помощь"
+        app.run()
+
+        self.assertFalse(app.exception)
+        filters = app.radio(key="archive-board-filter")
+        self.assertEqual(filters.options, ["Архив событий", "Новые задачи", "В работе", "Проверены"])
+        self.assertEqual(filters.value, "В работе")
+        app.button(key=f"archive-open-{incident_id}").click().run()
+        self.assertFalse(app.exception)
+        self.assertTrue(any("Ждём запчасть" in item.value for item in app.warning))
+        app.button(key=f"ticket-resume-{incident_id}").click()
+        app.button(key=f"archive-open-{incident_id}").click().run()
+        self.assertFalse(app.exception)
+        self.assertEqual(service.ticket(incident_id)["status"], "approved")
+        self.assertEqual(service.ticket(incident_id)["assignee_user_id"], worker["id"])
+
     def test_chat_reports_unknown_cost_and_future_failure_honestly(self):
         self.install()
         answer = service.ask_ai("Какой убыток у Kelmarsh 1?")
