@@ -187,10 +187,17 @@ def board(add_data):
     counts = service.ticket_counts()
     _metrics([("Событий в архиве", len(service.archive_report()["rows"]), "Исходные записи Kelmarsh"),
               ("Новых задач", counts["new"], "Проверки, созданные в FixList"),
-              ("В работе", counts["approved"], "Текущий статус задач FixList")])
-    statuses = {"Архив событий": "archived", "Новые задачи": "new", "В работе": "approved", "Нужна помощь": "escalated", "Проверены": "resolved"}
+              ("В работе", counts["approved"] + counts["escalated"], "Текущие проверки и запросы помощи")])
+    statuses = {
+        "Архив событий": ["archived"],
+        "Новые задачи": ["new"],
+        "В работе": ["approved", "escalated"],
+        "Проверены": ["resolved"],
+    }
+    if st.session_state.get("archive-board-filter") == "Нужна помощь":
+        st.session_state["archive-board-filter"] = "В работе"
     selected = st.radio("Показать", list(statuses), horizontal=True, key="archive-board-filter")
-    rows = service.tickets([statuses[selected]], limit=10000)
+    rows = service.tickets(statuses[selected], limit=10000)
     query = st.text_input("Поиск по оборудованию и сигналу", placeholder="Kelmarsh 1, насос, код…", key="archive-board-search").casefold().strip()
     rows = [row for row in rows if not query or query in (row["equipment_name"] + " " + row["raw_text"] + " " + (row.get("source_record") or {}).get("code", "")).casefold()]
     if not rows:

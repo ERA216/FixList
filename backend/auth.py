@@ -8,11 +8,14 @@ import hashlib
 import hmac
 import re
 import secrets
+import time
 from typing import Optional
 
 from . import db
 
 ROLE_LABELS = {"admin": "Администратор", "worker": "Сотрудник"}
+LOGIN_FAILURE_LIMIT = 5
+LOGIN_WINDOW_SECONDS = 15 * 60
 
 
 def hash_pin(pin: str, salt: Optional[str] = None) -> str:
@@ -27,7 +30,7 @@ def check_pin(pin: str, stored: str) -> bool:
 
 
 def _new_pin() -> str:
-    return f"{secrets.randbelow(9000) + 1000}"
+    return f"{secrets.randbelow(90_000_000) + 10_000_000}"
 
 
 def _company_code(name: str) -> str:
@@ -90,16 +93,45 @@ def add_workers(company_id: int, names_text: str, role: str = "worker") -> list[
     return [add_user(company_id, n, role) for n in names]
 
 
+def _login_window(conn, user_id, now):
+    return conn.execute("SELECT failures, expires_at FROM login_attempts WHERE user_id=? AND expires_at>?",
+                        (user_id, now)).fetchone()
+
+
 def login(company_code: str, login_: str, pin: str) -> Optional[dict]:
     with db.connect() as c:
-        r = c.execute("""SELECT u.*, c.name AS company_name, c.code AS company_code, c.is_demo FROM users u
+        row = c.execute("""SELECT u.*, c.name AS company_name, c.code AS company_code, c.is_demo FROM users u
                          JOIN companies c ON c.id = u.company_id WHERE upper(c.code)=upper(?) AND lower(u.login)=lower(?)""",
-                      ((company_code or "").strip(), (login_ or "").strip())).fetchone()
-    if not r or not check_pin((pin or "").strip(), r["pin_hash"]):
-        return None
-    u = dict(r)
-    u.pop("pin_hash")
-    return u
+                        ((company_code or "").strip(), (login_ or "").strip())).fetchone()
+        if row is None:
+            return None
+        window = _login_window(c, row["id"], time.time())
+        if window and window["failures"] >= LOGIN_FAILURE_LIMIT:
+            return None
+
+    # Verify the hash outside the SQLite write lock. Check the limit again
+    # inside the transaction so parallel attempts cannot bypass it.
+    valid = check_pin((pin or "").strip(), row["pin_hash"])
+    with db.connect() as c:
+        c.execute("BEGIN IMMEDIATE")
+        now = time.time()
+        window = _login_window(c, row["id"], now)
+        failures = window["failures"] if window else 0
+        if failures >= LOGIN_FAILURE_LIMIT:
+            return None
+        if not valid:
+            failures += 1
+            expires_at = (window["expires_at"] if window and failures < LOGIN_FAILURE_LIMIT
+                          else now + LOGIN_WINDOW_SECONDS)
+            c.execute("""INSERT INTO login_attempts(user_id, failures, expires_at) VALUES (?, ?, ?)
+                         ON CONFLICT(user_id) DO UPDATE SET failures=excluded.failures, expires_at=excluded.expires_at""",
+                      (row["id"], failures, expires_at))
+            return None
+        c.execute("DELETE FROM login_attempts WHERE user_id=?", (row["id"],))
+
+    user = dict(row)
+    user.pop("pin_hash")
+    return user
 
 
 def list_users(company_id: int) -> list[dict]:

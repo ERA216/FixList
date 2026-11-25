@@ -1,5 +1,6 @@
 """Проверки уведомлений: изолированная SQLite и подменённый SMTP, без настоящих писем."""
 import sys
+import sqlite3
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -105,6 +106,46 @@ class NotificationTests(unittest.TestCase):
         ], "Мастер смены 1")
         self.assertEqual(len(result["cards"]), 2)
         self.assertEqual(len(self.outbox()), 2)
+        self.assertEqual({row["incident_id"] for row in self.outbox()}, set(result["cards"]))
+
+    def test_failed_inspection_rolls_back_every_row_and_can_be_retried(self):
+        self.subscribe()
+        rows = [
+            {"equipment_id": "M2", "state": "remark", "note": "Вибрация"},
+            {"equipment_id": "M3", "state": "problem", "note": "Перегрев", "downtime_min": 20},
+        ]
+
+        def counts():
+            with db.connect() as c:
+                return {table: c.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                        for table in ("shift_logs", "incidents", "inspections", "email_outbox")}
+
+        def save():
+            return service.save_inspection(rows, self.worker["display_name"], author_user_id=self.worker["id"])
+
+        original_inspection = db.add_inspection
+
+        def fail_second_inspection(equipment_id, *args, **kwargs):
+            if equipment_id == "M3":
+                raise sqlite3.OperationalError("interrupted inspection write")
+            return original_inspection(equipment_id, *args, **kwargs)
+
+        original_enqueue = notifications.queue_incidents
+
+        def fail_after_enqueue(ids, conn):
+            original_enqueue(ids, conn)
+            raise sqlite3.OperationalError("interrupted notification enqueue")
+
+        before = counts()
+        for module, name, failure in ((db, "add_inspection", fail_second_inspection),
+                                      (notifications, "queue_incidents", fail_after_enqueue)):
+            with self.subTest(failure=name), patch.object(module, name, side_effect=failure):
+                with self.assertRaises(sqlite3.OperationalError):
+                    save()
+                self.assertEqual(counts(), before)
+
+        result = save()
+        self.assertEqual(counts(), {table: count + 2 for table, count in before.items()})
         self.assertEqual({row["incident_id"] for row in self.outbox()}, set(result["cards"]))
 
     def test_demo_and_existing_records_are_not_backfilled(self):
