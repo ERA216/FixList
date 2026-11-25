@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 import requests
 
-from backend import config, db, llm, service
+from backend import ai_evidence, config, db, llm, service
 from backend.schemas import ExtractionResult
 
 
@@ -146,6 +146,44 @@ class GeminiIntegrationTests(unittest.TestCase):
         self.assertEqual(plan["mode"], "archive")
         self.assertTrue(plan["warning"])
         self.assertEqual(len(plan["steps"]), 2)
+
+    def test_missing_confirmation_is_not_mistaken_for_a_completed_repair(self):
+        records = [{"id": 8, "description": "Ошибка преобразователя частоты"}]
+        quote = {"source_id": 8, "quote": records[0]["description"]}
+        valid = (
+            "Для архива Kelmarsh нет сведений о текущем состоянии и подтверждённых причинах ремонта.",
+            "Нет данных о подтверждённых причинах ремонта.",
+            "Нет информации об установленных и подтвержденных причинах ремонта.",
+            "Нет подтверждённых причин ремонта.",
+            "Проверьте отсутствие подтвержденных причин ремонта в записях.",
+        )
+        for commentary in valid:
+            with self.subTest(commentary=commentary):
+                reply = ai_evidence.GroundedReply(source_ids=[8], commentary=commentary, quotes=[quote])
+                self.assertEqual(ai_evidence.validate(reply, records, "Архивный сигнал"), commentary)
+        invalid = (
+            "Причина подтверждена.",
+            "Нет сведений о ремонте, но причина подтверждена.",
+            "Нет данных о ремонте, но подтверждённые причины известны.",
+            "Нет сведений о текущем состоянии, двигатель заменили.",
+        )
+        for commentary in invalid:
+            with self.subTest(commentary=commentary), self.assertRaises(llm.LLMBadOutput):
+                reply = ai_evidence.GroundedReply(source_ids=[8], commentary=commentary, quotes=[quote])
+                ai_evidence.validate(reply, records, "Архивный сигнал")
+
+    def test_quote_can_include_verified_code_and_duration_without_inventing_text(self):
+        from backend.assistant import _source
+
+        record = _source(db.incidents()[0])
+        text = record["evidence_text"]
+        quote = text[text.index(record["label"]):]
+        reply = ai_evidence.GroundedReply(source_ids=[record["id"]], commentary="Сверьте исходную запись с сервисным журналом.",
+                                          quotes=[{"source_id": record["id"], "quote": quote}])
+        self.assertEqual(ai_evidence.validate(reply, [record], text), reply.commentary)
+        reply.quotes[0].quote = quote + " Работы завершены."
+        with self.assertRaises(llm.LLMBadOutput):
+            ai_evidence.validate(reply, [record], text)
 
     def test_missing_key_never_sends_a_request(self):
         with patch.multiple(config, GEMINI_API_KEY="", GEMINI_API_KEY_2=""), patch("backend.llm.requests.post") as post:
