@@ -15,7 +15,9 @@ records — только записи текущей компании и выб�
 Не придумывай причины, выполненные ремонты, сотрудников, расходы или будущую дату отказа.
 Для архива Kelmarsh нет сведений о текущем состоянии и подтверждённых причинах ремонта.
 Верни JSON: source_ids (номера подходящих переданных записей в порядке важности),
-commentary (до трёх предложений на русском), quotes (source_id и дословный quote из соответствующей записи).
+commentary (до трёх предложений на русском), quotes (source_id и дословный quote из поля evidence_text, description или label соответствующей записи).
+Цитата должна быть непрерывным фрагментом одного поля. Не склеивай label, code и duration_min в новую цитату;
+для цитаты с кодом и длительностью скопируй готовый фрагмент evidence_text без изменений.
 Для пояснения обязательна хотя бы одна цитата. Используй только числа из переданных данных.
 Не добавляй ссылки и изображения. Пояснение — рекомендация для проверки, а не новый факт журнала."""
 OPEN = {"new", "approved", "escalated"}
@@ -28,10 +30,12 @@ class SourceSelection(ai_evidence.GroundedReply):
 
 def _source(row):
     source = row.get("source_record")
-    return {"id": row["id"], "equipment": row["equipment_name"], "date": row["occurred_at"][:10],
+    record = {"id": row["id"], "equipment": row["equipment_name"], "date": row["occurred_at"][:10],
             "time": row["occurred_at"][11:16], "utc": bool(source), "label": _label(row),
             "duration_min": round(row["downtime_min"], 2), "description": (source["message"] if source else row["raw_text"])[:350],
             "code": source["code"] if source else None, "reference": row.get("source_id")}
+    record["evidence_text"] = _event_line_from_source(record)
+    return record
 
 
 def _label(row):
@@ -88,11 +92,14 @@ def _hours(rows, period):
     return round(finance.for_events(rows, period, hourly_rate=0)["hours"], 2)
 
 
-def _event_line(row):
-    source = _source(row)
+def _event_line_from_source(source):
     stamp = f"{_date_label(date.fromisoformat(source['date']))} в {source['time']}" + (" UTC" if source["utc"] else "")
     code = f" (код {source['code']})" if source["code"] else ""
     return f"Запись №{source['id']} · {stamp} · {source['equipment']}: {source['label']}{code}, простой {num(source['duration_min'])} мин."
+
+
+def _event_line(row):
+    return _source(row)["evidence_text"]
 
 
 def _compare(topic, rows, period, is_archive, catalog, **assumptions):
