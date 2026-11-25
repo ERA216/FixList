@@ -129,6 +129,7 @@ html, body, .stApp, .stApp p, .stApp li, .stApp label, .stApp input, .stApp text
   .pagehead .ph-text {max-width:calc(100% - 187px);}
   .pagehead .art {width:182px; height:137px; right:20px; bottom:20px;}
 }
+.pagehead .art-photo {top:50%; bottom:auto; max-height:calc(100% - 34px); transform:translateY(-50%); object-fit:contain; filter:drop-shadow(1px 3px 3px #55392124);}
 
 /* ИИ предупреждает — мягкая персиковая карта-акцент */
 .warn {background:linear-gradient(135deg,#ffe2ce 0%,#fff1df 60%,#fff6e8 100%); color:var(--ink); border-radius:26px; padding:22px 26px 14px; margin:0 0 12px; position:relative; box-shadow:0 18px 40px #b8753d14;}
