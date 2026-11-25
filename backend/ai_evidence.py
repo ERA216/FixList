@@ -9,7 +9,7 @@ from .schemas import BaseModel, Field
 
 class EvidenceQuote(BaseModel):
     source_id: int
-    quote: str = Field(min_length=4, max_length=350)
+    quote: str = Field(min_length=4, max_length=350, description="Дословный непрерывный фрагмент поля evidence_text, description или label записи с указанным source_id. Не склеивать разные поля и не менять числа.")
 
 
 class GroundedReply(BaseModel):
@@ -47,7 +47,16 @@ def validate(reply, sources, facts):
         if _normal(reference) not in _normal(trusted):
             raise llm.LLMBadOutput("unknown equipment in explanation")
     completed = r"\b(?:заменили|заменён\w*|заменен\w*|отремонтир\w*|устранили|устранён\w*|устранен\w*|сэкономили|подтвержден\w*|подтверждён\w*)\b"
-    for word in re.findall(completed, text, re.I):
+    for claim in re.finditer(completed, text, re.I):
+        word = claim.group()
         if _normal(word) not in _normal(trusted):
+            # A full adjective in «нет сведений о подтверждённых причинах»
+            # describes missing evidence, not a confirmed repair. Keep rejecting
+            # affirmative short forms and clauses following «но» or punctuation.
+            if re.fullmatch(r"подтвержденн\w+", _normal(word)):
+                clause = re.split(r"[.!?;,:]|\b(?:но|однако|зато)\b", _normal(text[:claim.start()]))[-1]
+                if (re.search(r"\bнет\s+(?:сведений|данных|информации)\s+(?:о|об)\b", clause)
+                        or re.search(r"\b(?:нет|отсутствие)\s*$", clause)):
+                    continue
             raise llm.LLMBadOutput("unsupported completed work")
     return text
