@@ -15,6 +15,13 @@ def render(chat, *, can_open_finance):
         with st.chat_message("assistant"):
             answer = message.get("answer", message.get("a", ""))
             st.markdown(answer.partition("\n\n**Комментарий ИИ:** ")[0])
+            if message.get("mode") == "ai":
+                st.caption(f"ИИ · {message.get('provider', 'модель')} · расчёты выполнены по журналу")
+            else:
+                st.caption("Ответ по данным журнала · без обращения к ИИ")
+            if commentary := message.get("ai_commentary"):
+                st.markdown("**Пояснение ИИ**")
+                st.write(commentary)
             if sources := message.get("sources"):
                 with st.expander("Записи из журнала"):
                     for source in sources:
@@ -33,6 +40,6 @@ def render(chat, *, can_open_finance):
 
 
 def reply(question, chat):
-    with st.spinner("Ищем записи по вашему вопросу…"):
+    with st.spinner("Собираем данные и готовим ответ…"):
         chat.append({"q": question, **service.ask_ai(question, chat, **money_scenario.settings())})
     st.rerun()
