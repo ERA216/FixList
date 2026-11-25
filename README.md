@@ -1,6 +1,5 @@
 # FixList — обходы, проблемы, решения
 
-[![CI](https://github.com/ERA216/Hackathon/actions/workflows/ci.yml/badge.svg)](https://github.com/ERA216/Hackathon/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-f05a28.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/Python-3.11%2B-141a2e)
 ![Streamlit](https://img.shields.io/badge/Streamlit-1.45%2B-ff4b4b)
@@ -88,7 +87,7 @@
 Нужен Python 3.11+.
 
 ```sh
-git clone https://github.com/ERA216/Hackathon.git && cd Hackathon
+git clone https://github.com/ERA216/FixList.git && cd FixList
 python -m pip install -r requirements.txt
 cp .env.example .env            # Windows: copy .env.example .env — и впишите GEMINI_API_KEY
 python -m streamlit run app.py
