@@ -21,6 +21,10 @@ def status() -> dict:
     return {"ai_enabled": config.ai_enabled(), "mode_label": config.mode_label(), **db.llm_stats()}
 
 
+def ai_settings_signature() -> tuple:
+    return config.ai_settings_signature()
+
+
 def equipment_options() -> list[dict]:
     return db.load_equipment()
 
