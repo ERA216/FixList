@@ -253,6 +253,8 @@ def test_timeout_switches_model():
 
     saved = (config.LLM_PROVIDER, config.GEMINI_API_KEY, config.LLM_MODEL, requests.post)
     config.LLM_PROVIDER, config.GEMINI_API_KEY, config.LLM_MODEL = "gemini", "k1", "gemini-flash-lite-latest"
+    saved_fb = config.GEMINI_FALLBACK_MODELS
+    config.GEMINI_FALLBACK_MODELS = ["gemini-flash-lite-latest", "gemini-flash-latest"]
     requests.post = fake_post
     llm._working.clear()
     try:
@@ -260,6 +262,7 @@ def test_timeout_switches_model():
         llm.call_json("s", "u", ExtractionResult, "test")
     finally:
         config.LLM_PROVIDER, config.GEMINI_API_KEY, config.LLM_MODEL, requests.post = saved
+        config.GEMINI_FALLBACK_MODELS = saved_fb
         llm._working.clear()
     assert calls == ["gemini-flash-lite-latest", "gemini-flash-latest"]
 

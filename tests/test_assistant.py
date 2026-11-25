@@ -166,7 +166,11 @@ class AssistantTests(unittest.TestCase):
             self.assertEqual([row["id"] for row in good["sources"]], [older, self.last_feed])
             self.assertTrue(all(row["description"] == "Перегрев" for row in good["sources"]))
             call.return_value = SourceSelection(source_ids=[999876])
-            self.assertEqual(service.ask_ai(question), baseline)
+            rejected = service.ask_ai(question)
+            self.assertEqual(rejected["answer"], baseline["answer"])
+            self.assertEqual(rejected["sources"], baseline["sources"])
+            self.assertEqual(rejected["mode"], "rules")
+            self.assertTrue(rejected["warning"])
 
     def test_workers_receive_estimate_without_admin_navigation(self):
         from streamlit.testing.v1 import AppTest
