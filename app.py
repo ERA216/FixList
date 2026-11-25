@@ -2,6 +2,7 @@
 import streamlit as st
 import html
 import math
+import sqlite3
 import time
 from datetime import date
 from pathlib import Path
@@ -25,7 +26,7 @@ def _boot(data_revision):
     return True
 
 
-_boot("ticket-assignment-v1")
+_boot("login-throttle-v1")
 
 EXAMPLES = {
     "Станок №3 · ремень (повторяется)": "Линия 2, станок №3 встал в 14:10, порвался ремень. Поставили новый, простой 1,5 часа. Причину пока не установили.",
@@ -116,7 +117,7 @@ def landing():
                     sessions.start(user)
                     ss.page = ROLES[user["role"]][0]
                     st.rerun()
-                st.error("Неверный код компании, логин или PIN.")
+                st.error("Проверьте код компании, логин и PIN. После пяти неверных попыток повторите вход через 15 минут.")
             st.markdown('<div class="creds"><div class="demo-company"><span>Код компании</span>'
                         f'<strong>{html.escape(demo["code"])}</strong></div>'
                         '<table aria-label="Данные для входа"><thead><tr><th>Роль</th><th>Логин</th><th>PIN</th></tr></thead><tbody>' +
@@ -600,6 +601,8 @@ def page_inspection():
             st.success(f"Отчёт сохранён: проверено {res['checked']}, новых карточек для администратора — {len(res['cards'])}.")
         except ValueError as e:
             st.error(str(e))
+        except sqlite3.Error:
+            st.error("Не удалось сохранить обход. Попробуйте отправить отчёт ещё раз.")
 
 
 # ---------------- администратор: состояние оборудования ----------------

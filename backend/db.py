@@ -192,6 +192,11 @@ def init_db(path=None) -> None:
         users_sql = c.execute("SELECT sql FROM sqlite_master WHERE name='users'").fetchone()[0]
         if "mechanic" not in users_sql:  # старая база: роль «механик» не разрешена — пересоздаём таблицу
             c.executescript(USERS_REBUILD)
+        c.execute("""CREATE TABLE IF NOT EXISTS login_attempts (
+            user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+            failures INTEGER NOT NULL,
+            expires_at REAL NOT NULL
+        )""")
         for e in json.loads((config.DATA_DIR / "equipment.json").read_text(encoding="utf-8")):
             c.execute("INSERT OR IGNORE INTO equipment(id, name, line, hour_cost_kzt) VALUES (?,?,?,?)",
                       (e["id"], e["name"], e["line"], e["hour_cost_kzt"]))

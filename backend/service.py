@@ -221,20 +221,21 @@ def save_inspection(rows: list[dict], author: str, *, author_user_id=None) -> di
         if r["state"] != "ok" and not (r.get("note") or "").strip():
             raise ValueError(f"{eq[r['equipment_id']]['name']}: опишите замечание или проблему в комментарии.")
     cards = []
-    for r in rows:
-        incident_id = None
-        if r["state"] != "ok":
-            note = r["note"].strip()
-            label = "Проблема" if r["state"] == "problem" else "Замечание"
-            text = f"Обход · {eq[r['equipment_id']]['name']} · {label}: {note}"
-            with db.connect() as c:
+    with db.connect() as c:
+        for r in rows:
+            incident_id = None
+            note = (r.get("note") or "").strip()
+            if r["state"] != "ok":
+                label = "Проблема" if r["state"] == "problem" else "Замечание"
+                text = f"Обход · {eq[r['equipment_id']]['name']} · {label}: {note}"
                 log_id = db.add_shift_log(text, "processed", "inspection", conn=c, author=author, author_user_id=author_user_id)
                 incident_id = db.add_incident(log_id, {"equipment_id": r["equipment_id"], "failure_type": extract.detect_failure(note),
                                                        "downtime_min": int(r.get("downtime_min") or 0), "parts": [], "cause": None,
                                                        "action": None, "confidence": 1.0}, conn=c)
-                notifications.queue_incidents([incident_id], conn=c)
-            cards.append(incident_id)
-        db.add_inspection(r["equipment_id"], r["state"], (r.get("note") or "").strip() or None, author, incident_id)
+                cards.append(incident_id)
+            db.add_inspection(r["equipment_id"], r["state"], note or None, author, incident_id, conn=c)
+        if cards:
+            notifications.queue_incidents(cards, conn=c)
     return {"checked": len(rows), "cards": cards}
 
 
