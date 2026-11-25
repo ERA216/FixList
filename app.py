@@ -1,0 +1,963 @@
+"""FixList — рабочее приложение: интерфейс из ui_preview.py, подключённый к backend.service."""
+import streamlit as st
+import html
+import math
+import time
+from datetime import date
+from pathlib import Path
+from urllib.parse import urlencode
+
+from backend import service
+from backend.schemas import MAX_DOWNTIME_MIN, kzt, loss_label
+from ui.theme import apply_theme, card, deck, heading
+from ui.charts import activity_chart, downtime_chart
+from ui import archive_workspace, assistant_chat, money_scenario, report_parts, sessions, ticket_assignment, ticket_history, ticket_plan, workspace_data
+
+st.set_page_config(page_title="FixList · обходы, проблемы, решения", page_icon=str(Path(__file__).resolve().parent / "assets" / "favicon.png"), layout="wide")
+apply_theme()
+
+
+@st.cache_resource
+def _boot(data_revision):
+    # Versioned primary-data migration; invalidates the previous cached bootstrap.
+    service.bootstrap()
+    service.start_notifications()
+    return True
+
+
+_boot("ticket-assignment-v1")
+
+EXAMPLES = {
+    "Станок №3 · ремень (повторяется)": "Линия 2, станок №3 встал в 14:10, порвался ремень. Поставили новый, простой 1,5 часа. Причину пока не установили.",
+    "Станок №4 · перегрев": "Станок №4 опять перегрелся к обеду, на радиаторе много пыли. Остановили на 40 минут, продули — запустили.",
+    "Два станка в одной записи": "Насос Н-1 потёк, подтянули сальник, простой 25 мин. Станок №5 гудит и вибрирует, подшипник греется — остановили на 1 час, заменили подшипник.",
+    "На казахском": "4-станок қызып кетті, 30 минут тұрды. Желдеткішті тазаладық.",
+    "Электрика компрессора": "Компрессор: выбило автомат, свет в цеху моргнул. Включили через 20 минут.",
+    "Нет данных — проверка вопросов": "Что-то сломалось на линии, разбирались долго.",
+    "Станка нет в справочнике": "Станок №9 встал, простой 20 минут.",
+}
+ROLES = {
+    "worker": ["Обход", "Новая запись", "Мои задачи", "Спросить ИИ"],
+    "admin": ["Панель задач", "Спросить ИИ", "Состояние оборудования", "Сводка дня", "Аномалии", "План экономии", "История и эффект", "Сотрудники"],
+}
+ROLE_TITLE = {"worker": "Сотрудник", "admin": "Администратор"}
+ROLE_HINT = {
+    "worker": "Обходите оборудование и сдавайте отчёт. Найденные проблемы сразу станут карточками у администратора.",
+    "admin": "Все данные и изменения в одном месте. ИИ предлагает решения, считает убытки и заранее предупреждает о рисках.",
+}
+NAV_LABEL = {("worker", "Обход"): "Отчёт об обходе", ("worker", "Новая запись"): "Сообщить о проблеме",
+             ("admin", "Аномалии"): "Что ломается чаще", ("admin", "План экономии"): "Деньги и экономия", ("admin", "История и эффект"): "История"}
+STEP_OF_PAGE = {"Спросить ИИ": 4, "Обход": 1, "Новая запись": 1, "Мои задачи": 3, "Панель задач": 3, "Состояние оборудования": 4, "Сводка дня": 4,
+                "Аномалии": 4, "План экономии": 4, "История и эффект": 2, "Сотрудники": 1}
+RISK_CLASS = {"high": "s-esc", "medium": "s-app", "low": "s-res"}
+RISK_LABEL = {"high": "Высокий риск", "medium": "Средний риск", "low": "Норма"}
+STATUS_CLASS = {"new": "s-new", "approved": "s-app", "escalated": "s-esc", "resolved": "s-res"}
+ISSUE_TEXT = {
+    "equipment": "Станок не найден в справочнике — выберите вручную.",
+    "downtime": "Длительность простоя не подтверждена текстом — укажите вручную.",
+    "downtime_unverified": "ИИ назвал длительность, которой нет в тексте, — значение отброшено.",
+    "cause_removed": "ИИ предложил причину, которой нет в тексте, — она удалена.",
+    "action_unverified": "Действие из черновика требует подтверждения. Укажите, что сделали.",
+    "parts_unverified": "Часть предложенных запчастей или их количество требуют подтверждения. Проверьте список.",
+    "low_confidence": "Низкая уверенность — проверьте поля.",
+    "type_from_history": "Симптомы в тексте не описаны — тип поломки подставлен по истории этого станка. Проверьте.",
+}
+ss = st.session_state
+status = service.status()
+
+
+# ---------------- главная и вход ----------------
+def brand_link():
+    params = st.query_params.to_dict()
+    params["_refresh"] = str(time.time_ns())
+    url = html.escape("?" + urlencode(params), quote=True)
+    return f'<a class="brand brand-link" href="{url}" target="_self" aria-label="FixList — обновить страницу">Fix<span>List</span></a>'
+
+
+def enter_workspace(account):
+    company, admin = account["company"], account["admin"]
+    user = service.login(company["code"], admin["login"], admin["pin"])
+    sessions.start(user)
+    ss.page = "Панель задач"
+    ss["show-workspace-forms"] = True
+    ss["new-workspace-access"] = {"code": company["code"], "login": admin["login"], "pin": admin["pin"]}
+    if "import_result" in account:
+        ss["data_import_result"] = account["import_result"]
+    else:
+        ss["workspace-message"] = "Первое оборудование сохранено. Можно записать событие."
+    st.rerun()
+
+
+def landing():
+    st.markdown('<div class="topbar">' + brand_link() + '<div class="pill">Для заводов, цехов и мастерских</div></div>', unsafe_allow_html=True)
+    st.markdown('<div class="hero"><div class="eyebrow">Обходы · проблемы · решения</div>'
+                '<h1>Поломки записаны.<br>Решения видны.</h1>'
+                '<p class="intro">Сотрудник обходит оборудование и записывает данные. Найденные проблемы становятся карточками, '
+                'а ИИ помогает администратору решить их, считает убытки и заранее предупреждает о рисках.</p>'
+                '<a class="hero-action" href="#add-own-data" target="_self">Добавить свои данные ↓</a></div>', unsafe_allow_html=True)
+    deck()
+    st.markdown('<div class="how"><div><b>01 · ОБОРУДОВАНИЕ</b><p>Введите оборудование вручную или загрузите готовые таблицы CSV.</p></div>'
+                '<div><b>02 · СОБЫТИЯ</b><p>Записывайте, что произошло, и отслеживайте задачи и простои.</p></div>'
+                '<div><b>03 · КОМАНДА</b><p>Администратор добавляет сотрудников списком. Они сообщают о проблемах с телефона и решают одобренные задачи с ИИ.</p></div></div>',
+                unsafe_allow_html=True)
+    demo = service.demo_credentials()
+    left, right = st.columns(2, gap="large")
+    with left:
+        with st.container(border=True):
+            st.subheader("Войти")
+            with st.form("login"):
+                code = st.text_input("Код компании", placeholder="например, FIXLIST")
+                login_ = st.text_input("Логин", placeholder="например, master")
+                pin = st.text_input("PIN-код", type="password", max_chars=8)
+                ok = st.form_submit_button("Войти →", type="primary", use_container_width=True)
+            if ok:
+                user = service.login(code, login_, pin)
+                if user:
+                    sessions.start(user)
+                    ss.page = ROLES[user["role"]][0]
+                    st.rerun()
+                st.error("Неверный код компании, логин или PIN.")
+            st.markdown('<div class="creds"><div class="demo-company"><span>Код компании</span>'
+                        f'<strong>{html.escape(demo["code"])}</strong></div>'
+                        '<table aria-label="Данные для входа"><thead><tr><th>Роль</th><th>Логин</th><th>PIN</th></tr></thead><tbody>' +
+                        "".join(f'<tr><td>{html.escape(u["name"].split()[0])}</td><td><strong>{html.escape(u["login"])}</strong></td>'
+                                f'<td><strong>{html.escape(u["pin"])}</strong></td></tr>' for u in demo["users"]) + '</tbody></table></div>',
+                        unsafe_allow_html=True)
+    with right:
+        with st.container(border=True):
+            workspace_data.start(enter_workspace)
+
+
+if "s" in st.query_params:
+    del st.query_params["s"]  # ignore links from the old URL-based sign-in
+USER = sessions.current_user()
+if not USER:
+    if ss.get("user"):
+        ss.clear()
+        st.info("Сеанс завершён. Войдите в кабинет снова.")
+    landing()
+    st.stop()
+
+ROLE = "admin" if USER["role"] == "admin" else "worker"
+service.use_company(USER["company_id"])
+PUBLIC_ARCHIVE = bool(service.archive_context())
+EQUIPMENT = service.equipment_options()
+EQ_LABEL = {e["id"]: f"{e.get('code', e['id'])} · {e['name']}" for e in EQUIPMENT}
+FAILURES = service.failure_options()
+AVAILABLE_PAGES = ROLES[ROLE]
+if ss.get("page") not in AVAILABLE_PAGES:
+    ss.page = AVAILABLE_PAGES[0]
+
+
+def go(page):
+    if page in AVAILABLE_PAGES:
+        ss.page = page
+        st.rerun()
+
+
+def flow():
+    """Путь данных: видно, на каком шаге находится пользователь."""
+    active = STEP_OF_PAGE.get(ss.page, 1)
+    steps = ["Сотрудник обходит и записывает", "Данные в базе", "Проблемы — карточками", "Администратор решает с ИИ: убытки, прогноз"]
+    html = '<span>→</span>'.join((f"<b>0{i} &nbsp; {t}</b>" if i == active else f"<span>0{i} &nbsp; {t}</span>") for i, t in enumerate(steps, 1))
+    st.markdown(f'<div class="steps">{html}</div>', unsafe_allow_html=True)
+
+
+def loss_card(label, loss, detail, *, parts=0, tone=None):
+    value = loss_label(loss) if loss is not None else "—"
+    note = detail if loss is not None else f"{detail} · {loss_label(None, parts)}"
+    card(label, value, note, tone=tone or ("warning" if (loss or 0) > 0 else "neutral"))
+
+
+def logout():
+    sessions.end()
+
+
+@st.dialog("Аккаунт")
+def account_dialog():
+    sessions.require_user()
+    initials = "".join(part[0] for part in USER["display_name"].split()[:2]).upper()
+    st.markdown(
+        '<div class="account-profile account-dialog-profile">'
+        f'<div class="account-avatar" aria-hidden="true">{html.escape(initials)}</div>'
+        f'<div class="account-info"><strong>{html.escape(USER["display_name"])}</strong>'
+        f'<small>{html.escape(ROLE_TITLE[ROLE])}</small></div></div>',
+        unsafe_allow_html=True,
+    )
+    details = [
+        ("Логин", USER.get("login", "—")),
+        ("Роль", ROLE_TITLE[ROLE]),
+        ("Компания", USER["company_name"]),
+        ("Код компании", USER["company_code"]),
+    ]
+    st.markdown(
+        '<dl class="account-details">' + "".join(
+            f'<div><dt>{label}</dt><dd>{html.escape(value)}</dd></div>'
+            for label, value in details
+        ) + '</dl>', unsafe_allow_html=True,
+    )
+    if ROLE == "admin":
+        service.use_company(USER["company_id"])
+        mail = service.notification_settings(USER["id"])
+        st.subheader("Уведомления о поломках")
+        st.caption("На указанную почту будут приходить новые заявки и замечания с обходов вашей компании.")
+        with st.form("email-notifications"):
+            recipient = st.text_input("Почта для уведомлений", value=mail["recipient"], placeholder="name@gmail.com")
+            enabled = st.checkbox("Получать уведомления о новых проблемах", value=mail["enabled"])
+            save_mail = st.form_submit_button("Сохранить уведомления", use_container_width=True)
+        if save_mail:
+            try:
+                service.save_notification_settings(USER["id"], recipient, enabled)
+            except ValueError as exc:
+                st.error(str(exc))
+            else:
+                mail = service.notification_settings(USER["id"])
+                st.success("Настройки уведомлений сохранены.")
+        if not mail["configured"]:
+            st.info("Почта отправителя ещё не подключена на сервере. Адрес можно сохранить сейчас; отправка начнётся после подключения.")
+        elif mail["enabled"]:
+            st.caption(f"В очереди: {mail['pending']} · отправлено: {mail['sent']} · не доставлено: {mail['failed']}")
+            if st.button("Отправить тестовое письмо", key="test-notification", use_container_width=True):
+                try:
+                    service.test_notification(USER["id"])
+                    st.success("Тестовое письмо добавлено в очередь отправки.")
+                except ValueError as exc:
+                    st.error(str(exc))
+            if mail["failed"]:
+                st.warning(mail["last_error"])
+                if st.button("Повторить отправку недоставленных писем", key="retry-notifications", use_container_width=True):
+                    service.retry_notifications(USER["id"])
+                    st.success("Письма снова поставлены в очередь.")
+    if st.button("Выйти из аккаунта", key="profile-logout", use_container_width=True):
+        logout()
+
+
+# ---------------- боковая панель ----------------
+open_account = False
+with st.sidebar:
+    st.markdown(brand_link() + '<div class="brand-sub">Обходы · проблемы · решения</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="workspace">{html.escape(USER["company_name"])}<small>Код компании: {html.escape(USER["company_code"])}</small></div>', unsafe_allow_html=True)
+    for i, page in enumerate(AVAILABLE_PAGES):
+        label = NAV_LABEL.get((ROLE, page), page)
+        if service.archive_context() and page == "Аномалии":
+            label = "Повторяющиеся сигналы"
+        if st.button(f"0{i+1}   {label}", type="primary" if ss.page == page else "secondary", use_container_width=True, key=f"nav_{page}"):
+            go(page)
+    st.divider()
+    with st.container(border=True, key="sidebar-account"):
+        initials = "".join(part[0] for part in USER["display_name"].split()[:2]).upper()
+        account_detail = ROLE_TITLE[ROLE] + (f' · {USER["login"]}' if USER.get("login") else "")
+        with st.container(key="account-trigger"):
+            st.markdown(
+                '<div class="account-profile">'
+                f'<div class="account-avatar" aria-hidden="true">{html.escape(initials)}</div>'
+                '<div class="account-info"><span>Аккаунт</span>'
+                f'<strong>{html.escape(USER["display_name"])}</strong>'
+                f'<small>{html.escape(account_detail)}</small></div>'
+                '<span class="account-chevron" aria-hidden="true">›</span></div>',
+                unsafe_allow_html=True,
+            )
+            open_account = st.button("Открыть аккаунт", key="open-account", use_container_width=True)
+        if st.button("Выйти", use_container_width=True):
+            logout()
+
+if open_account:
+    account_dialog()
+
+
+
+# ---------------- 01 · новая запись ----------------
+def page_new_record():
+    if ROLE == "worker":
+        heading("02 / Сообщить о проблеме", "Что случилось?\nНапишите как есть.", "Своими словами, можно с телефона. ИИ разберёт запись, а администратор сразу её увидит.")
+    else:
+        heading("06 / Запись смены", "Хорошая смена начинается\nс ясной картины.", "Расскажите, что произошло. FixList превратит запись в историю оборудования и сам заметит повторяющиеся поломки.")
+    left, right = st.columns([1.9, 1], gap="large")
+    with left:
+        with st.container(border=True):
+            st.subheader("Что произошло на смене?")
+            st.caption("Пишите привычными словами — на русском или казахском. Можно несколько станков в одной записи.")
+            if service.archive_context():
+                with st.expander("Проверить разбор записи из практики · MaintIE"):
+                    archive_workspace.maintenance_examples()
+            elif imported := next((e for e in EQUIPMENT if e.get("code")), None):
+                st.caption(f"Укажите название или код из вашего справочника, например {EQ_LABEL[imported['id']]}.")
+            else:
+                ex_col, btn_col = st.columns([2.2, 1])
+                ex_name = ex_col.selectbox("Пример", list(EXAMPLES), label_visibility="collapsed")
+                if btn_col.button("Вставить пример", use_container_width=True):
+                    ss.raw = EXAMPLES[ex_name]
+                    ss.pop("analysis", None)
+            raw = st.text_area("Отчёт мастера", key="raw", height=170, placeholder="Какой станок? Что случилось? Как долго стоял?", label_visibility="collapsed")
+            st.caption(f"{len(raw)} / 4000 символов · Без имён, телефонов и других персональных данных")
+            if st.button("Разобрать запись  →", type="primary", use_container_width=True):
+                try:
+                    with st.spinner("ИИ разбирает запись и ищет причину, код проверяет поля…" if status["ai_enabled"] else "Разбираю по правилам…"):
+                        ss.analysis = {"raw": raw.strip(), **service.analyze_text(raw)}
+                        ss.analysis_id = ss.get("analysis_id", 0) + 1
+                    ss.pop("saved_signals", None)
+                except ValueError as e:
+                    st.error(str(e))
+                except Exception as e:  # приложение не должно падать
+                    st.error(f"Не удалось разобрать запись: {e}. Попробуйте ещё раз.")
+            review(raw)
+            saved_signals()
+    with right:
+        if ROLE == "worker":
+            st.markdown('<div class="section-label">Как писать</div>', unsafe_allow_html=True)
+            st.markdown("**Что** сломалось — номер станка.\n\n**Что** случилось — шум, перегрев, порвался ремень.\n\n**Сколько** стояли — «40 минут», «полтора часа».")
+            st.caption("Заявку сразу увидит администратор. После одобрения её можно будет решить с анализом ИИ.")
+            mine = service.tickets(author_user_id=USER["id"], limit=3)
+            if mine:
+                st.markdown('<div class="section-label">Ваши последние заявки</div>', unsafe_allow_html=True)
+                for t in mine:
+                    st.caption(f"{t['status_label']} · {t['equipment_name']} · {t['time'][5:]}")
+            return
+        st.markdown('<div class="section-label">Из записей — в решения</div>', unsafe_allow_html=True)
+        dash = service.dashboard()
+        top_sig = dash["anomalies"][0] if dash["anomalies"] else None
+        if top_sig:
+            loss_card(f"Потери · {top_sig['equipment_name']} / {dash['window_days']} дн.", top_sig["loss_kzt"], top_sig["failure_label"],
+                      parts=top_sig.get("parts_kzt", 0), tone="danger" if top_sig["severity"] == "high" else "warning")
+        loss_card("Все потери от простоев", dash["total_loss_kzt"], f"За {dash['window_days']} дней · {dash['total_downtime_h']} ч простоя",
+                  parts=dash.get("parts_kzt", 0))
+        st.subheader("Как это работает")
+        st.markdown("**01 · ИИ извлекает поля**\n\nСтанок, поломка, простой, запчасти.\n\n**02 · Код проверяет**\n\nСтанок — из справочника, минуты — из текста, причины не выдумываются.\n\n**03 · Код считает**\n\nПотери, интервалы, окупаемость мер.")
+
+
+def review(raw):
+    a = ss.get("analysis")
+    if not a:
+        return
+    st.divider()
+    if a["mode"] == "ai":
+        st.caption("Поля извлечены ИИ и проверены кодом. Подтвердите перед сохранением.")
+    else:
+        st.caption("Резервный режим: поля найдены по правилам, без ИИ. Проверьте их внимательно.")
+    if a.get("warning"):
+        st.warning(a["warning"])
+    current = a["raw"] == raw.strip()
+    if not current:
+        st.info("Текст изменён после разбора — нажмите «Разобрать запись» ещё раз.")
+    for q in a["questions"]:
+        st.info("" + q)
+    if not a["drafts"]:
+        return
+    st.subheader("Проверьте перед сохранением")
+    eq_ids = [e["id"] for e in EQUIPMENT]
+    edited = []
+    valid_parts = True
+    for i, d in enumerate(a["drafts"]):
+        draft_key = f"{ss['analysis_id']}_{i}"
+        with st.container(border=True):
+            st.caption(f"ИНЦИДЕНТ {i+1} · уверенность {d['confidence']:.0%}")
+            for issue in d["issues"]:
+                if issue in ISSUE_TEXT:
+                    st.warning(ISSUE_TEXT[issue])
+            c1, c2, c3 = st.columns([1.4, 1.4, 1])
+            eq_opts = [None] + eq_ids
+            eq = c1.selectbox("Оборудование", eq_opts, index=eq_opts.index(d["equipment_id"]) if d["equipment_id"] in eq_ids else 0,
+                              format_func=lambda x: "— выберите станок —" if x is None else EQ_LABEL[x], key=f"eq_{draft_key}")
+            ft_keys = list(FAILURES)
+            ft = c2.selectbox("Тип неисправности", ft_keys, index=ft_keys.index(d["failure_type"]), format_func=FAILURES.get, key=f"ft_{draft_key}")
+            mins = c3.number_input("Простой, мин", min_value=0, max_value=MAX_DOWNTIME_MIN, value=int(d["downtime_min"] or 0), step=1, key=f"dt_{draft_key}")
+            if d.get("downtime_quote"):
+                st.caption(f"Источник: «{d['downtime_quote']}» → {d['downtime_min']} мин")
+            c4, c5 = st.columns(2)
+            ckey = f"cause_{draft_key}"
+            ss.setdefault(ckey, d.get("cause") or "")
+            cause = c4.text_input("Причина (подтверждает мастер)", placeholder="Не установлена — выберите гипотезу ниже или впишите", key=ckey)
+            action = c5.text_input("Что сделали", value=d.get("action") or "", key=f"act_{draft_key}")
+            parts, parts_cost, parts_valid = report_parts.edit(d, draft_key)
+            valid_parts = valid_parts and parts_valid
+            render_hypotheses(d, ckey)
+            edited.append({**d, "equipment_id": eq, "failure_type": ft, "downtime_min": None if ("downtime" in d["issues"] and mins == 0) else mins,
+                           "cause": cause or None, "action": action or None, "parts": parts,
+                           "parts_cost_kzt": parts_cost, "parts_cost_known": parts_cost is not None})
+    if st.button("Подтвердить и сохранить", type="primary", disabled=not current or not valid_parts) and current and valid_parts:
+        try:
+            res = service.save_record(a["raw"], edited, a["mode"], author_user_id=USER["id"])
+            ss.saved_signals = res["signals"]
+            ss.pop("analysis", None)
+            ss.pop("plans", None)
+            st.success(f"Запись #{res['log_id']} сохранена: инцидентов — {len(res['incident_ids'])}. Заявка ушла администратору на одобрение.")
+        except ValueError as e:
+            st.error(str(e))
+
+
+def _accept(key, text):
+    ss[key] = text
+
+
+def render_hypotheses(d, ckey):
+    hyps = d.get("hypotheses") or []
+    if not hyps:
+        return
+    h = d.get("history") or {}
+    src = "Гипотезы ИИ" if d.get("diagnosis_mode") == "ai" else "Гипотезы по правилам"
+    hist_note = f" · похожих поломок за {h.get('window_days', 30)} дн.: {h.get('failures_in_window', 0)}" if h else ""
+    if h.get("intervals_days"):
+        hist_note += " · интервалы: " + " → ".join(map(str, h["intervals_days"])) + " дн."
+    with st.expander(f"Возможные причины — {src}{hist_note}", expanded=True):
+        st.caption("Причины выбраны только из базы типовых причин. Это гипотезы: проверьте их перед тем, как принять.")
+        for j, hy in enumerate(hyps):
+            a, b = st.columns([4, 1.3])
+            with a:
+                st.markdown(f"**{j+1}. {hy['title']}** · вероятность {hy['confidence']:.0%}")
+                st.caption(hy["why"])
+                st.markdown("Проверить: " + "; ".join(hy["checks"]))
+            b.button("Принять", key=f"acc_{ckey}_{j}", on_click=_accept, args=(ckey, hy["title"]), use_container_width=True)
+
+
+def _plan_key(event):
+    key = (event["equipment_id"], event["failure_type"])
+    return (*key, event["custom_event_type"]) if event.get("custom_event_type") else key
+
+
+def saved_signals():
+    """Сигналы после сохранения: рисуются при каждой перерисовке, чтобы кнопка перехода работала."""
+    if ROLE != "admin":
+        if ss.get("saved_signals") is not None:
+            st.caption("Заявка ушла администратору на одобрение. Статус — в разделе «Мои задачи».")
+        return
+    for s in ss.get("saved_signals", []):
+        st.markdown(f'<div class="signal"><div class="signal-title">↗ &nbsp; {html.escape(s["title"])}</div><p>{html.escape(s["message"])}</p></div>', unsafe_allow_html=True)
+        target = _plan_key(s)
+        if st.button("Посмотреть план экономии →", key=f"go_{target}", type="primary"):
+            ss.plan_target = target
+            go("План экономии")
+
+
+# ---------------- руководитель: сводка дня ----------------
+def page_brief():
+    heading("01 / Сводка дня", "Что произошло сегодня\nи что проверить.", "Код собирает факты из базы: новые записи, повторяющиеся поломки, потери. ИИ объясняет главное простыми словами. Числа в тексте ИИ сверяются с базой.")
+    sm = service.today_summary()
+    with st.container(key="brief-metrics"):
+        c = st.columns(4)
+        with c[0]:
+            card("Загружено сегодня", str(sm["logs_today"]), f"Инцидентов: {sm['incidents_today']}")
+        with c[1]:
+            card("Простой сегодня", f"{sm['downtime_h_today']} ч".replace(".", ","), "По записям мастеров", tone="warning" if sm["downtime_h_today"] > 0 else "neutral")
+        with c[2]:
+            loss_card("Потери сегодня", sm["loss_today_kzt"], "Простой × стоимость часа + запчасти", parts=sm["parts_today_kzt"])
+        with c[3]:
+            card("В базе записей", str(sm["total_logs"]), f"История с {sm['history_since']}")
+
+    key = (date.today(), sm["total_logs"], service.status()["ai_enabled"])
+    if ss.get("brief_key") != key or st.button("Обновить сводку"):
+        with st.spinner("ИИ готовит сводку по данным из базы…"):
+            ss.brief, ss.brief_key = service.daily_brief(), key
+    b = ss.brief
+    with st.container(border=True, key="daily-brief"):
+        st.caption("СВОДКА ИИ · числа сверены с базой" if b["mode"] == "ai" else "СВОДКА ПО ШАБЛОНУ · без ИИ")
+        st.subheader(b["headline"])
+        for pt in b["points"]:
+            st.markdown(f"- {pt}")
+        if b.get("warning"):
+            st.caption("" + b["warning"])
+        if b["priorities"]:
+            st.markdown("**Приоритеты на сегодня**")
+            for i, pr in enumerate(b["priorities"], 1):
+                st.markdown(f"{i}. **{pr['equipment']}** — {pr['action']}")
+
+    st.subheader("Загружено сегодня")
+    if sm["records"]:
+        record_columns = st.columns(2, gap="large")
+        for i, r in enumerate(sm["records"]):
+            with record_columns[i % 2]:
+                with st.expander(f"{r['time']} · {r['equipment_name']} · {r['downtime_min']} мин"):
+                    st.write(r["raw_text"])
+                    st.caption(f"{r['failure_label']} · причина: {r['cause'] or 'не установлена'} · потери: {loss_label(r['loss_kzt'], r['parts_kzt'])}")
+    else:
+        st.info("Сегодня мастера ещё ничего не записали.")
+
+    if sm["per_day"]:
+        activity_chart(sm["per_day"])
+
+    cnt = service.ticket_counts()
+    st.markdown(f"**Заявки:** нужна помощь — {cnt['escalated']} · ждут одобрения — {cnt['new']} · решают сотрудники — {cnt['approved']} · решено сегодня — {cnt['resolved_today']}")
+    if (cnt["new"] or cnt["escalated"]) and st.button("Открыть панель задач →"):
+        go("Панель задач")
+    st.subheader("Что проверить сегодня")
+    st.caption("По каждой повторяющейся поломке — самая вероятная причина из базы типовых причин и конкретные проверки. Отметки живут в текущем сеансе.")
+    render_checklist()
+
+
+# ---------------- общие элементы заявок ----------------
+def ticket_card(t):
+    """Компактная пастельная карточка заявки."""
+    import html as _h
+    text = _h.escape(t["raw_text"].replace("ДЕМО · ", ""))
+    elapsed = archive_workspace.duration(t["source_record"]["duration_seconds"]) if t.get("source_record") else f'{t["downtime_min"]} мин'
+    assignee = ticket_assignment.label(t)
+    executor = f"<br>Исполнитель · {_h.escape(assignee)}" if assignee else ""
+    st.markdown(f'''<div class="tcard {STATUS_CLASS[t["status"]]}"><div class="tc-top">{_h.escape(t["status_label"])}</div>
+        <div class="tc-title">{_h.escape(t["equipment_name"])}</div><div class="tc-text">{text}</div>
+        <div class="tc-foot">{_h.escape(t["failure_label"])} · {elapsed} · {t["time"][5:]}{executor}</div></div>''', unsafe_allow_html=True)
+
+
+def ai_hints(t):
+    hyps = service.ticket_hypotheses(t)
+    if service.archive_context():
+        st.caption("Причина и выполненный ремонт в исходном журнале не указаны. Результат проверки заполняет сотрудник FixList.")
+        return hyps
+    st.markdown("**Анализ ИИ: вероятные причины и что проверить**")
+    for h in hyps:
+        st.markdown(f"- **{h['title']}** · {h['confidence']:.0%} — " + "; ".join(h["checks"]))
+    return hyps
+
+
+def resolve_form(t, hyps, user, key):
+    opts = ["Не установлена"] + [h["title"] for h in hyps] + ["Другая"]
+    cause = st.selectbox("Причина", opts, key=f"cause_sel_{key}")
+    if cause == "Другая":
+        cause = st.text_input("Своя причина", key=f"cause_own_{key}")
+    done = st.text_input("Что сделали", placeholder="Например: заменили ремень, отрегулировали натяжитель", key=f"done_{key}")
+    if st.button("Решено", key=f"close_{key}", type="primary"):
+        try:
+            service.resolve_ticket(t["id"], user["display_name"], done, None if cause == "Не установлена" else cause,
+                                   expected_status=t["status"], actor_user_id=user["id"])
+            st.rerun()
+        except ValueError as e:
+            st.error(str(e))
+
+
+# ---------------- сотрудник: мои задачи ----------------
+def page_tasks():
+    heading("03 / Мои задачи", "Поручено — значит,\nможно решать.", "Здесь задачи, назначенные вам, и заявки из общей очереди.")
+    tasks = service.tickets(["approved"], limit=None, worker_user_id=USER["id"])
+    tasks.sort(key=lambda task: task["assignee_user_id"] == USER["id"], reverse=True)
+    st.subheader(f"Задачи к решению · {len(tasks)}")
+    if not tasks:
+        st.info("Одобренных задач нет. Новые появятся, когда администратор одобрит заявку.")
+    page_size = 12
+    pages = max(1, math.ceil(len(tasks) / page_size))
+    page_key = "worker-task-page"
+    if ss.get(page_key, 1) > pages:
+        ss[page_key] = pages
+    page = st.number_input("Страница задач", min_value=1, max_value=pages, step=1, key=page_key) if pages > 1 else 1
+    for t in tasks[(page - 1) * page_size:page * page_size]:
+        with st.container(border=True):
+            a, b = st.columns([1, 1.6], gap="large")
+            with a:
+                ticket_card(t)
+            with b:
+                confirmed = t["confirmed_solution"]
+                hyps = ticket_plan.show_confirmed(confirmed) if confirmed else ai_hints(t)
+                tab1, tab2 = st.tabs(["Решили сами", "Нужна помощь администратора"])
+                with tab1:
+                    resolve_form(t, hyps, USER, f"w{t['id']}")
+                with tab2:
+                    note = st.text_area("Чего не хватает?", placeholder="Например: нужна запчасть, которой нет на складе; нужен электрик; нужна закупка",
+                                        height=80, key=f"esc_{t['id']}")
+                    if st.button("Передать администратору", key=f"escb_{t['id']}"):
+                        try:
+                            service.escalate_ticket(t["id"], USER["display_name"], note,
+                                                    expected_status=t["status"], actor_user_id=USER["id"])
+                            st.rerun()
+                        except ValueError as e:
+                            st.error(str(e))
+    st.subheader("Мои заявки")
+    mine = service.tickets(author_user_id=USER["id"], limit=12)
+    if not mine:
+        st.caption("Вы ещё не отправляли заявок.")
+    cols = st.columns(3)
+    for i, t in enumerate(mine):
+        with cols[i % 3]:
+            ticket_card(t)
+            if t["status"] == "resolved":
+                st.caption(f"Сделано: {t['resolution'] or '—'}")
+    if st.button("Сообщить о новой проблеме", type="primary", use_container_width=True):
+        go("Новая запись")
+
+
+# ---------------- сотрудник: отчёт об обходе ----------------
+STATE_OPTS = {"Норма": "ok", "Замечание": "remark", "Проблема": "problem"}
+
+
+def page_inspection():
+    import pandas as pd
+    heading("01 / Отчёт об обходе", "Проверили — записали.\nВсё уходит в базу.", "Отметьте состояние каждого аппарата. Замечания и проблемы сразу станут карточками у администратора, а ИИ подскажет, как их решить.")
+    done = service.inspections_today()
+    if done:
+        st.caption(f"Сегодня уже записано проверок: {len(done)}. Можно сдать ещё один отчёт — он добавится к истории.")
+    equipment_labels = {e["id"]: EQ_LABEL[e["id"]] if e.get("code") else e["name"] for e in EQUIPMENT}
+    df = pd.DataFrame([{"Оборудование": equipment_labels[e["id"]], "Линия": e["line"], "Состояние": "Норма", "Комментарий": "", "Простой, мин": 0}
+                       for e in EQUIPMENT])
+    edited = st.data_editor(df, hide_index=True, use_container_width=True, key="insp_editor", disabled=["Оборудование", "Линия"],
+                            column_config={"Состояние": st.column_config.SelectboxColumn("Состояние", options=list(STATE_OPTS), required=True),
+                                           "Комментарий": st.column_config.TextColumn("Комментарий", help="Обязателен для замечания и проблемы"),
+                                           "Простой, мин": st.column_config.NumberColumn("Простой, мин", min_value=0, max_value=MAX_DOWNTIME_MIN, step=1)})
+    rows = edited.to_dict("records") if hasattr(edited, "to_dict") else list(edited)
+    issues = sum(r["Состояние"] != "Норма" for r in rows)
+    st.caption(f"Проверено аппаратов: {len(rows)} · с замечаниями и проблемами: {issues}")
+    if st.button("Сдать отчёт об обходе", type="primary", use_container_width=True):
+        label_to_id = {label: equipment_id for equipment_id, label in equipment_labels.items()}
+        try:
+            res = service.save_inspection([{"equipment_id": label_to_id[r["Оборудование"]], "state": STATE_OPTS[r["Состояние"]], "note": r["Комментарий"] or "",
+                                            "downtime_min": int(r["Простой, мин"] or 0)} for r in rows], USER["display_name"],
+                                          author_user_id=USER["id"])
+            st.success(f"Отчёт сохранён: проверено {res['checked']}, новых карточек для администратора — {len(res['cards'])}.")
+        except ValueError as e:
+            st.error(str(e))
+
+
+# ---------------- администратор: состояние оборудования ----------------
+def page_health():
+    heading("02 / Состояние оборудования", "Что может сломаться —\nвидно заранее.", "Для каждого аппарата код считает поломки, убытки и ритм отказов и прогнозирует следующую поломку. Это предупреждение по истории, а не гарантия.")
+    hs = service.equipment_health()
+    c = st.columns(3)
+    with c[0]:
+        high_risk = sum(h["risk"] == "high" for h in hs)
+        card("Высокий риск", str(high_risk), "аппаратов требуют внимания", tone="danger" if high_risk else "neutral")
+    with c[1]:
+        losses = sum(h["loss_kzt"] for h in hs) if all(h["loss_kzt"] is not None for h in hs) else None
+        loss_card("Убытки за 30 дней", losses, "простой × стоимость часа + запчасти", parts=sum(h["parts_kzt"] for h in hs))
+    with c[2]:
+        card("Среднее здоровье парка", f"{round(sum(h['health'] for h in hs) / max(1, len(hs)))}%", f"аппаратов: {len(hs)}")
+    cols = st.columns(3)
+    for i, h in enumerate(hs):
+        with cols[i % 3]:
+            nxt = ("срок уже наступил" if h["days_to_next"] is not None and h["days_to_next"] <= 0 else
+                   f"следующая поломка через ~{h['days_to_next']} дн." if h["days_to_next"] is not None else "прогноза нет — мало данных")
+            st.markdown(f'''<div class="tcard {RISK_CLASS[h["risk"]]}"><div class="tc-top">{RISK_LABEL[h["risk"]]} · здоровье {h["health"]}%</div>
+                <div class="tc-title">{html.escape(h["equipment_name"])}</div><div class="tc-text">{nxt}. Потери за 30 дн.: {loss_label(h["loss_kzt"], h["parts_kzt"])}</div>
+                <div class="tc-foot">{html.escape(h["line"] or "")} · поломок за 30 дн.: {h["failures"]}</div></div>''', unsafe_allow_html=True)
+            with st.expander("Почему так"):
+                st.write(h["explanation"])
+                if h["risk"] != "low" and h["failures"]:
+                    if st.button("Что сделать и сколько стоит", key=f"hplan_{h['equipment_id']}", use_container_width=True):
+                        from datetime import date
+                        today = date.today().isoformat()
+                        types = [_plan_key(t) for t in service.tickets(limit=999)
+                                 if t["equipment_id"] == h["equipment_id"] and t["occurred_at"][:10] <= today]
+                        ss.plan_target = max(types, key=types.count) if types else (h["equipment_id"], "other")
+                        go("План экономии")
+
+
+def _live(fn):
+    """Блок, который сам обновляется каждые 15 секунд (если версия Streamlit это умеет)."""
+    frag = getattr(st, "fragment", None)
+    return frag(run_every=15)(fn) if frag else fn
+
+
+@_live
+def ai_warnings():
+    import html as _h
+    from datetime import datetime
+
+    user = sessions.require_user()
+    if not user or user["role"] != "admin" or st.session_state.get("show-workspace-forms"):
+        return
+    # A scheduled fragment can run on a new thread without the app's company context.
+    service.use_company(user["company_id"])
+    if service.archive_context():
+        return
+
+    risky = [h for h in service.equipment_health() if h["risk"] != "low"][:3]
+    if not risky:
+        return
+    rows = ""
+    for h in risky:
+        nxt = (f"следующая поломка возможна через ~{h['days_to_next']} дн." if h["days_to_next"] is not None and h["days_to_next"] > 0
+               else "срок поломки уже наступил" if h["days_to_next"] is not None else "мало данных для прогноза")
+        rows += (f'<div class="warn-row"><span class="dot {h["risk"]}"></span><b>{_h.escape(h["equipment_name"])}</b>'
+                 f'<span class="warn-meta">здоровье {h["health"]}% · потери за 30 дн.: {loss_label(h["loss_kzt"], h["parts_kzt"])} · {nxt}</span></div>')
+    cnt = service.ticket_counts()
+    st.markdown(f'<div class="warn"><div class="warn-head"><span class="warn-tag">ИИ предупреждает</span>'
+                f'<span class="warn-sub">обновлено в {datetime.now():%H:%M:%S} · пересчёт каждые 15 сек · открытых заявок: {cnt["new"] + cnt["approved"] + cnt["escalated"]}</span></div>{rows}</div>',
+                unsafe_allow_html=True)
+    if st.button("Состояние всего оборудования →", key="to_health"):
+        go("Состояние оборудования")
+
+
+# ---------------- спросить ИИ ----------------
+EXAMPLE_QUESTIONS = ["Какие заявки открыты?", "Какое оборудование простаивало дольше?", "Какие поломки повторяются?", "Что проверить в первую очередь?"]
+
+
+def page_ask():
+    heading("Спросить ИИ", "Спросите по своим данным", "Укажите оборудование, период или номер записи. FixList покажет, на каких событиях основан ответ.")
+    chat = ss.setdefault("chat", [])
+    cols = st.columns(len(EXAMPLE_QUESTIONS))
+    picked = None
+    for c, q in zip(cols, EXAMPLE_QUESTIONS):
+        if c.button(q, use_container_width=True, key=f"exq_{q}"):
+            picked = q
+    assistant_chat.render(chat, can_open_finance="План экономии" in AVAILABLE_PAGES)
+    q = st.chat_input("Например: сколько часов простоя было за последние 7 дней?", max_chars=2000) or picked
+    if q:
+        assistant_chat.reply(q, chat)
+
+
+# ---------------- администратор: панель задач ----------------
+def page_board():
+    heading("01 / Панель задач", "Выберите, что решить\nв первую очередь.", "Добавляйте свои события, открывайте карточки и поручайте проверки сотрудникам.")
+    board_data_controls()
+    ai_warnings()
+    focused_ticket, work_message = ss.pop(ticket_assignment.WORK_QUEUE_REQUEST, (None, None))
+    if focused_ticket:
+        ss["company-board-status"] = "approved"
+        st.success(work_message)
+    cnt = service.ticket_counts()
+    labels = {"escalated": f"Нужна помощь · {cnt['escalated']}", "new": f"Ждут одобрения · {cnt['new']}",
+              "approved": f"В работе · {cnt['approved']}", "resolved": "Решённые"}
+    if "company-board-status" not in ss:
+        ss["company-board-status"] = "escalated" if cnt["escalated"] else "new"
+    status = st.radio("Фильтр", list(labels), format_func=labels.get, horizontal=True, label_visibility="collapsed",
+                      index=None, key="company-board-status")
+    items = service.tickets([status], limit=None)
+    if not items:
+        st.info("Здесь пусто — всё решено.")
+        return
+    page_size = 12
+    pages = math.ceil(len(items) / page_size)
+    page_key = f"board-page-{status}"
+    if focused_ticket:
+        ss[page_key] = next((index // page_size + 1 for index, row in enumerate(items) if row["id"] == focused_ticket), 1)
+    if ss.get(page_key, 1) > pages:
+        ss[page_key] = 1
+    page = st.number_input("Страница", min_value=1, max_value=pages, step=1, key=page_key) if pages > 1 else 1
+    archive_workspace.event_grid(items[(page - 1) * page_size:page * page_size], ticket_detail)
+
+
+@st.dialog("Событие оборудования", width="large")
+def ticket_detail(incident_id, *, return_to=None):
+    user = sessions.require_user()
+    service.use_company(user["company_id"])
+    t = service.ticket(incident_id)
+    if not t:
+        st.error("Запись не найдена.")
+        return
+    archive_workspace.render_event_details(t, user)
+    ticket_assignment.resume(t, user)
+    if t["status"] == "resolved":
+        st.success(f"Решено: {t['resolution'] or '—'}" + (f" · причина: {t['cause']}" if t["cause"] else "") + (f" · {t['assignee']}" if t["assignee"] else ""))
+        history = ticket_history.render(t, return_to=return_to)
+        ticket_plan.render(t, user, history)
+        return
+
+    if st.button("Деньги и экономия по этой поломке", key="to_plan"):
+        ss.plan_target = _plan_key(t)
+        go("План экономии")
+    result_area = st.container()
+    history = ticket_history.render(t, return_to=return_to)
+    worker_id = ticket_assignment.select(t, user)
+    hyps = ticket_plan.render(t, user, history, assignee_user_id=worker_id)
+    if t["status"] == "new" and st.button("Поручить сотрудникам", type="primary", key="approve", use_container_width=True):
+        try:
+            service.approve_ticket(incident_id, user["display_name"], expected_status=t["status"],
+                                   assignee_user_id=worker_id, actor_user_id=user["id"])
+            ticket_assignment.open_work_queue(incident_id)
+        except ValueError as error:
+            st.error(str(error))
+    with result_area, st.expander("Записать результат проверки"):
+        resolve_form(t, hyps, user, f"board_{incident_id}")
+
+
+def board_data_controls():
+    workspace_data.board_controls(USER, ticket_detail, enter_workspace, PUBLIC_ARCHIVE)
+
+
+def render_checklist():
+    items = service.checklist()
+    if not items:
+        st.info("Повторяющихся поломок нет — проверять нечего.")
+    for i, it in enumerate(items):
+        with st.container(border=True):
+            a, b = st.columns([3, 1])
+            with a:
+                st.markdown(f"<span class='dot {'high' if it['severity'] == 'high' else 'medium'}'></span>**{html.escape(it['equipment_name'])}** · вероятная причина: **{html.escape(it['cause'])}**", unsafe_allow_html=True)
+                st.caption(f"{it['why']} · потери за период: {loss_label(it['loss_kzt'], it['parts_kzt'])}")
+                for j, chk in enumerate(it["checks"]):
+                    st.checkbox(chk, key=f"chk_{_plan_key(it)}_{j}")
+            with b:
+                if ROLE == "admin" and st.button("План экономии →", key=f"plan_{i}", use_container_width=True):
+                    ss.plan_target = _plan_key(it)
+                    go("План экономии")
+
+
+# ---------------- руководитель: сотрудники ----------------
+def page_staff():
+    heading("05 / Сотрудники", "Добавьте людей —\nи они начнут писать.", "Вставьте список сотрудников, по одному на строку. Каждый получит логин и PIN для входа с телефона. Персональные данные не обязательны: можно «Мастер смены 2».")
+    st.markdown(f"Сотрудники входят на главной странице: код компании <span class='cred'>{USER['company_code']}</span>, свой логин и PIN.", unsafe_allow_html=True)
+    left, right = st.columns([1, 1.3], gap="large")
+    with left:
+        with st.container(border=True):
+            st.subheader("Добавить списком")
+            with st.form("add_staff"):
+                names = st.text_area("Сотрудники", placeholder="Мастер смены 2\nМеханик\nОператор пресса", height=140)
+                role = st.selectbox("Роль", ["worker", "admin"], format_func={"worker": "Сотрудник — сообщает и решает задачи", "admin": "Администратор — одобряет, деньги, анализ"}.get)
+                add = st.form_submit_button("Добавить и выдать доступы", type="primary", use_container_width=True)
+            if add:
+                try:
+                    ss.new_staff = service.add_workers(USER["company_id"], names, role)
+                except ValueError as e:
+                    st.error(str(e))
+            if ss.get("new_staff"):
+                st.success("Доступы созданы. Передайте их сотрудникам — PIN показывается только сейчас.")
+                st.dataframe([{"Сотрудник": u["display_name"], "Логин": u["login"], "PIN": u["pin"]} for u in ss.new_staff], use_container_width=True, hide_index=True)
+    with right:
+        st.subheader("Кто уже в системе")
+        users = service.list_users(USER["company_id"])
+        st.dataframe([{"Сотрудник": u["display_name"], "Логин": u["login"], "Роль": ROLE_TITLE[u["role"]], "Добавлен": u["created_at"][:10]} for u in users],
+                     use_container_width=True, hide_index=True)
+
+
+# ---------------- 02 · аномалии ----------------
+def page_anomalies():
+    heading("02 / Сигналы производства", "Заметьте повторение.\nОстановите потери.", "Код проверяет всю историю: повторяемость, сокращение интервалов, всплески простоя. Каждый сигнал — со ссылками на записи смен.")
+    dash = service.dashboard()
+    sigs = dash["anomalies"]
+    c = st.columns(3)
+    with c[0]:
+        loss_card("Потери от простоев", dash["total_loss_kzt"], f"За {dash['window_days']} дней · все станки", parts=dash["parts_kzt"])
+    with c[1]:
+        card("Аварийный простой", f"{dash['total_downtime_h']} ч".replace(".", ","), f"За {dash['window_days']} дней", tone="warning" if dash["total_downtime_h"] > 0 else "neutral")
+    with c[2]:
+        card("Сигналов", str(len(sigs)), "Требуют внимания", tone="warning" if sigs else "neutral")
+    if not sigs:
+        st.info("Повторяющихся поломок за период нет.")
+        return
+    labels = [f"{'Высокий' if s['severity'] == 'high' else 'Средний'} · {s['title']} · {loss_label(s['loss_kzt'], s['parts_kzt'])}" for s in sigs]
+    idx = st.radio("Сигналы", range(len(sigs)), format_func=lambda i: labels[i], label_visibility="collapsed")
+    s = sigs[idx]
+    st.markdown(f'<div class="signal"><div class="signal-title">↗ &nbsp; {html.escape(s["title"])}</div><p>{html.escape(s["message"])}</p></div>', unsafe_allow_html=True)
+    st.caption(f"Расчёт потерь: {s['formula']}")
+    ev = service.incident_evidence(s["incident_ids"])
+    downtime_chart(ev)
+    st.subheader("На чём основан сигнал")
+    for e in ev:
+        with st.expander(f"#{e['id']} · {e['date']} · {e['downtime_min']} мин"):
+            st.write(e["raw_text"])
+    if st.button("Посмотреть план экономии →", type="primary"):
+        ss.plan_target = _plan_key(s)
+        go("План экономии")
+    with st.expander("Потери по всем станкам"):
+        st.dataframe([{"Станок": r["equipment_name"], "Поломок": r["failures"], "Простой, ч": r["downtime_h"],
+                       "Потери, ₸": r["loss_kzt"], "Известные расходы на запчасти, ₸": r["parts_kzt"]} for r in dash["by_equipment"]],
+                     use_container_width=True, hide_index=True)
+
+
+# ---------------- 03 · план экономии ----------------
+def page_plan():
+    heading("03 / Деньги и экономия", "Сколько стоит простой", "Оцените потери по своему журналу, проверьте окупаемость и сравните меры для конкретной проблемы.")
+    money_scenario.show()
+    if not EQ_LABEL:
+        return
+    st.subheader("Меры для конкретной проблемы")
+    dash = service.dashboard()
+    names = {_plan_key(s): s["title"] for s in dash["anomalies"]}
+    targets = list(names)
+    cur = ss.get("plan_target")
+    if cur and cur not in targets:
+        targets.insert(0, cur)
+    if not targets:
+        st.info("Нет сигналов для расчёта. Выберите станок и тип поломки вручную.")
+        c1, c2 = st.columns(2)
+        eq = c1.selectbox("Станок", list(EQ_LABEL), format_func=EQ_LABEL.get)
+        ft = c2.selectbox("Тип", list(FAILURES), format_func=FAILURES.get)
+        targets = [(eq, ft)]
+    t = st.selectbox("Для какой проблемы", targets, index=targets.index(cur) if cur in targets else 0,
+                     format_func=lambda x: names.get(x, f"{EQ_LABEL[x[0]]} · {x[2] if len(x) == 3 else FAILURES[x[1]]}"))
+    ss.plan_target = t
+    plans = ss.setdefault("plans", {})
+    if t not in plans or st.button("Пересчитать"):
+        with st.spinner("Подбираю меры из базы и считаю окупаемость…"):
+            try:
+                plans[t] = service.savings_plan(*t)
+            except Exception as e:
+                st.error(f"Не удалось построить план: {e}")
+                return
+    p = plans[t]
+    st_ = p["stats"]
+    if not p["measures"]:
+        st.info(p["summary"])
+        return
+    with st.container(border=True):
+        st.caption("СФОРМИРОВАНО ИИ · числа проверены кодом" if p["ai_generated"] else "ШАБЛОН БЕЗ ИИ · расчёт кодом")
+        st.write(p["summary"])
+        if p.get("warning"):
+            st.caption("" + p["warning"])
+        st.caption(f"Базовые потери: {st_['formula']} · источники: " + ", ".join(f"#{i}" for i in st_["incident_ids"]))
+    applied = service.applied_set()
+    with st.container(key="savings-comparison"):
+        st.subheader("Сравнение мер")
+        st.caption("Экономия и окупаемость — расчётные оценки для выбранной проблемы.")
+        for i, m in enumerate(p["measures"]):
+            with st.container(key=f"measure-row-{i}"):
+                main, cost, saving, payback, action = st.columns([2.4, 1.3, 1.4, 1.2, 1.6], gap="small")
+                with main:
+                    st.markdown(f'<div class="measure-title"><span>МЕРА {i+1:02d} · {html.escape(m["measure_id"])}</span>'
+                                f'<strong>{html.escape(m["title"])}</strong></div>', unsafe_allow_html=True)
+                with cost:
+                    st.markdown('<div class="comparison-cell"><span>Внедрение, разово</span>'
+                                f'<strong>{kzt(m["one_time_kzt"])} ₸</strong>'
+                                f'<small>+ {kzt(m["monthly_kzt"])} ₸/мес</small></div>', unsafe_allow_html=True)
+                with saving:
+                    estimate = f"≈ {kzt(m['savings_kzt'])} ₸" if m["savings_kzt"] is not None else "—"
+                    st.markdown('<div class="comparison-cell"><span>Экономия / мес</span>'
+                                f'<strong>{estimate}</strong><small>{"Расчётная оценка" if m["savings_kzt"] is not None else "Нет оценки"}</small></div>', unsafe_allow_html=True)
+                with payback:
+                    st.markdown('<div class="comparison-cell"><span>Окупаемость</span>'
+                                f'<strong>{html.escape(m["payback_label"])}</strong><small>Расчётная оценка</small></div>', unsafe_allow_html=True)
+                with action:
+                    key = (t[0], m["measure_id"])
+                    is_on = key in applied
+                    if st.button("Отменить отметку" if is_on else "Отметить внедрение", key=f"apply_{m['measure_id']}", use_container_width=True):
+                        (service.unmark_applied if is_on else service.mark_applied)(*key)
+                        st.rerun()
+                    if is_on:
+                        st.caption("Внедрено · эффект появится в «Истории»")
+                with st.expander("Обоснование и расчёт"):
+                    st.write(m["note"])
+                    if m.get("why"):
+                        st.write("ИИ: " + m["why"])
+                    st.write("Экономия: " + m["formula"])
+                    if m.get("payback_formula"):
+                        st.write("Окупаемость: " + m["payback_formula"])
+
+
+# ---------------- 04 · история и эффект ----------------
+def page_history():
+    heading("04 / История и эффект", "Знания остаются.\nДаже когда смена уходит.", "Исходные записи смен и результат внедрённых мер по реальным данным «до/после».")
+    effs = service.effects()
+    if effs:
+        for e in effs:
+            st.subheader(f"Эффект меры · {e['equipment_name']} · {e['measure_title']}")
+            a, b, c = st.columns(3)
+            before = f"{e['avg_interval_before']:g} дн." if e.get("avg_interval_before") else "—"
+            after = f"{e['avg_interval_after']:g} дн." if e.get("avg_interval_after") else "ещё нет поломок"
+            effect_tone = {"improved": "success", "no_improvement": "warning"}.get(e["status"], "neutral")
+            with a:
+                card("Интервал до внедрения", before, f"Поломок до: {e['failures_before']}")
+            with b:
+                card("Интервал после", after, f"Внедрено {e['applied_at']} · {e['days_since']} дн. назад", tone=effect_tone)
+            with c:
+                verdict = {"improved": f"×{e.get('ratio', 0):g}".replace(".", ","), "no_improvement": "без улучшения",
+                           "waiting": "ждём данных", "no_failures_since": "поломок нет"}.get(e["status"], "—")
+                card("Изменение", verdict, "Наблюдение, а не доказательство причинности", tone=effect_tone)
+    else:
+        st.info("Внедрённых мер пока нет. Отметьте меру на экране «План экономии».")
+    st.subheader("Журнал записей")
+    query = st.text_input("Поиск в истории", placeholder="Номер записи, станок или причина…")
+    rows = service.history(query)
+    if rows:
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+    else:
+        st.info("Записей по этому запросу нет. Попробуйте номер станка или очистите поиск.")
+
+
+pages = {"Спросить ИИ": page_ask, "Обход": page_inspection, "Новая запись": page_new_record, "Мои задачи": page_tasks, "Панель задач": page_board, "Состояние оборудования": page_health,
+         "Сводка дня": page_brief, "Аномалии": page_anomalies, "План экономии": page_plan, "История и эффект": page_history, "Сотрудники": page_staff}
+if PUBLIC_ARCHIVE:
+    archive_workspace.source_banner()
+    pages.update({"Панель задач": lambda: archive_workspace.board(board_data_controls), "Состояние оборудования": archive_workspace.health,
+                  "Сводка дня": archive_workspace.daily, "Аномалии": archive_workspace.signals,
+                  "План экономии": archive_workspace.finance, "История и эффект": archive_workspace.history,
+                  "Спросить ИИ": lambda: archive_workspace.ask(can_open_finance="План экономии" in AVAILABLE_PAGES)})
+pages[ss.page]()
+if history_target := ss.pop(ticket_history.OPEN_REQUEST, None):
+    incident_id, return_to = history_target
+    open_ticket = archive_workspace.event_dialog if PUBLIC_ARCHIVE else ticket_detail
+    open_ticket(incident_id, return_to=return_to)
+
