@@ -54,8 +54,7 @@ def create_account(conn, workspace_name):
     if not 2 <= len(workspace_name) <= 120:
         raise ValueError("Укажите название кабинета из 2–120 символов.")
     company = auth.create_company(workspace_name, conn=conn)
-    pin = f"{secrets.randbelow(90_000_000) + 10_000_000}"
-    admin = auth.add_user(company["id"], "Администратор", "admin", login="admin", pin=pin, conn=conn)
+    admin = auth.add_user(company["id"], "Администратор", "admin", login="admin", conn=conn)
     return {"company": company, "admin": admin}
 
 
