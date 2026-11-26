@@ -298,13 +298,7 @@ def signals():
 
 def finance():
     heading("06 / Деньги и экономия", "Сколько стоит простой", "Оцените стоимость остановок Kelmarsh и возможную экономию при сокращении простоя.")
-    view = service.archive_report()
-    money_scenario.show(view)
-    if view["signals"]:
-        repeated = view["signals"][0]
-        equipment = repeated["events"][0]["equipment_name"]
-        st.info(f"Пример из архива: на {equipment} по коду {repeated['code']} («{repeated['label']}») зафиксировано событий: "
-                f"{repeated['count']}. Сверьте журнал по этому коду и выясните, какие остановки можно предотвратить.")
+    money_scenario.show(service.archive_report())
 
 
 def history():
@@ -323,8 +317,6 @@ def ask(*, can_open_finance):
             picked = question
     chat = st.session_state.setdefault("archive-chat", [])
     assistant_chat.render(chat, can_open_finance=can_open_finance)
-    with st.expander("Проверить разбор технической записи · MaintIE"):
-        _maintie()
     question = st.chat_input("Например: сколько часов простоя у Kelmarsh 1 в январе?", max_chars=2000) or picked
     if question:
         assistant_chat.reply(question, chat)

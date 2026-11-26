@@ -59,22 +59,26 @@ class NotificationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             service.notification_settings(self.worker["id"])
 
-    def test_account_connects_email_without_a_separate_enable_step(self):
+    def test_account_saves_email_even_when_the_sender_is_missing(self):
         from streamlit.testing.v1 import AppTest
 
         app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py"), default_timeout=25)
         app.session_state["user"] = self.admin
         app.session_state["session-expires-at"] = time() + 3600
-        with patch.object(service, "bootstrap"), patch.object(service, "start_notifications"):
+        with patch.object(config, "SMTP_PASSWORD", ""), patch.object(service, "bootstrap"), patch.object(service, "start_notifications"):
             app.run()
             app.button(key="open-account").click().run()
             next(field for field in app.text_input if field.label == "Почта для уведомлений").set_value("owner@example.com")
-            next(button for button in app.button if button.label == "Подключить почту").click()
+            next(button for button in app.button if button.label == "Сохранить адрес").click()
             app.button(key="open-account").click().run()
             self.assertFalse(app.exception)
             settings = service.notification_settings(self.admin["id"])
             self.assertEqual(settings["recipient"], "owner@example.com")
             self.assertTrue(settings["enabled"])
+            self.assertTrue(any("Адрес для уведомлений сохранён" in message.value for message in app.success))
+            self.assertFalse(any("Отправка писем приостановлена" in message.value for message in app.warning))
+            self.assertFalse(any("Уведомления включены · в очереди" in message.value for message in app.caption))
+            self.assertFalse(any(button.label == "Отправить тестовое письмо" for button in app.button))
             app.button(key="disable-notifications").click()
             app.button(key="open-account").click().run()
             self.assertFalse(app.exception)
