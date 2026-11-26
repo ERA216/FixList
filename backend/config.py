@@ -46,7 +46,11 @@ LLM_MAX_RETRIES = _number_setting("LLM_MAX_RETRIES", 2, 0, 3, integer=True)
 ANALYSIS_WINDOW_DAYS = int(os.getenv("ANALYSIS_WINDOW_DAYS", "30"))
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.7"))
 
-# Отправитель уведомлений. Адрес получателя задаётся отдельно для каждой компании.
+# Общий отправитель уведомлений по HTTPS. Получатель задаётся в кабинете компании.
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "").strip()
+RESEND_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "").strip()
+
+# Поддержка существующих SMTP-настроек.
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com").strip()
 try:
     SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))

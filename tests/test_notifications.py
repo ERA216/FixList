@@ -6,6 +6,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
+from time import time
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -19,6 +20,7 @@ class NotificationTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.config_patch = patch.multiple(
             config, DB_PATH=Path(self.temp.name) / "notifications.db", LLM_PROVIDER="mock",
+            RESEND_API_KEY="", RESEND_FROM_EMAIL="",
             SMTP_HOST="smtp.gmail.com", SMTP_PORT=465, SMTP_USER="sender@gmail.com", SMTP_PASSWORD="test-only-password",
         )
         self.config_patch.start()
@@ -56,6 +58,27 @@ class NotificationTests(unittest.TestCase):
             service.save_notification_settings(self.worker["id"], "worker@gmail.com", True)
         with self.assertRaises(ValueError):
             service.notification_settings(self.worker["id"])
+
+    def test_account_connects_email_without_a_separate_enable_step(self):
+        from streamlit.testing.v1 import AppTest
+
+        app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py"), default_timeout=25)
+        app.session_state["user"] = self.admin
+        app.session_state["session-expires-at"] = time() + 3600
+        with patch.object(service, "bootstrap"), patch.object(service, "start_notifications"):
+            app.run()
+            app.button(key="open-account").click().run()
+            next(field for field in app.text_input if field.label == "Почта для уведомлений").set_value("owner@example.com")
+            next(button for button in app.button if button.label == "Подключить почту").click()
+            app.button(key="open-account").click().run()
+            self.assertFalse(app.exception)
+            settings = service.notification_settings(self.admin["id"])
+            self.assertEqual(settings["recipient"], "owner@example.com")
+            self.assertTrue(settings["enabled"])
+            app.button(key="disable-notifications").click()
+            app.button(key="open-account").click().run()
+            self.assertFalse(app.exception)
+            self.assertFalse(service.notification_settings(self.admin["id"])["enabled"])
 
     def test_new_record_is_queued_once_with_problem_details(self):
         self.subscribe()
@@ -275,6 +298,44 @@ class NotificationTests(unittest.TestCase):
             self.assertEqual(notifications.process_pending(), 1)
             names = [call[0] for call in smtp.method_calls]
             self.assertLess(names.index("starttls"), names.index("login"))
+
+    def test_resend_can_send_saved_notifications_without_smtp(self):
+        self.subscribe()
+        self.record()
+        item = self.outbox()[0]
+        with patch.multiple(config, RESEND_API_KEY="test-api-key", RESEND_FROM_EMAIL="notify@example.com", SMTP_PORT=0), \
+             patch.object(notifications.requests, "post") as post:
+            post.return_value.status_code = 200
+            post.return_value.json.return_value = {"id": "email-id"}
+            self.assertTrue(service.notification_settings(self.admin["id"])["configured"])
+            self.assertEqual(notifications.process_pending(), 1)
+            self.assertEqual(notifications.process_pending(), 0)
+        post.assert_called_once_with(
+            "https://api.resend.com/emails",
+            headers={"Authorization": "Bearer test-api-key", "Idempotency-Key": item["message_id"].strip("<>")},
+            json={"from": "notify@example.com", "to": ["owner@gmail.com"], "subject": item["subject"], "text": item["body"]},
+            timeout=10, allow_redirects=False,
+        )
+        self.assertEqual(self.outbox()[0]["state"], "sent")
+
+    def test_resend_retries_keep_queue_and_hide_provider_response(self):
+        self.subscribe()
+        self.record()
+        with patch.multiple(config, RESEND_API_KEY="test-api-key", RESEND_FROM_EMAIL="notify@example.com", SMTP_PORT=0), \
+             patch.object(notifications.requests, "post") as post:
+            post.return_value.status_code = 403
+            post.return_value.text = "test-api-key"
+            self.assertEqual(notifications.process_pending(), 0)
+            row = self.outbox()[0]
+            self.assertEqual(row["state"], "pending")
+            self.assertIn("Почтовый сервис отклонил отправку", row["last_error"])
+            self.assertNotIn("test-api-key", row["last_error"])
+            with db.connect() as c:
+                c.execute("UPDATE email_outbox SET next_attempt_at='2000-01-01T00:00:00'")
+            post.return_value.status_code = 200
+            post.return_value.json.return_value = {"id": "email-id"}
+            self.assertEqual(notifications.process_pending(), 1)
+        self.assertEqual(post.call_args_list[0].kwargs["headers"], post.call_args_list[1].kwargs["headers"])
 
     def test_test_email_requires_saved_recipient_and_sender(self):
         with self.assertRaises(ValueError):

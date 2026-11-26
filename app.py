@@ -201,23 +201,30 @@ def account_dialog():
         service.use_company(USER["company_id"])
         mail = service.notification_settings(USER["id"])
         st.subheader("Уведомления о поломках")
-        st.caption("На указанную почту будут приходить новые заявки и замечания с обходов вашей компании.")
+        st.caption("На этот адрес будут приходить новые заявки и замечания с обходов вашей компании.")
         with st.form("email-notifications"):
-            recipient = st.text_input("Почта для уведомлений", value=mail["recipient"], placeholder="name@gmail.com")
-            enabled = st.checkbox("Получать уведомления о новых проблемах", value=mail["enabled"])
-            save_mail = st.form_submit_button("Сохранить уведомления", use_container_width=True)
+            recipient = st.text_input("Почта для уведомлений", value=mail["recipient"], placeholder="name@example.com")
+            save_mail = st.form_submit_button("Подключить почту", use_container_width=True)
         if save_mail:
             try:
-                service.save_notification_settings(USER["id"], recipient, enabled)
+                service.save_notification_settings(USER["id"], recipient, True)
             except ValueError as exc:
                 st.error(str(exc))
             else:
                 mail = service.notification_settings(USER["id"])
-                st.success("Настройки уведомлений сохранены.")
+                if mail["configured"]:
+                    st.success("Почта для уведомлений подключена.")
+        if mail["enabled"] and st.button("Отключить уведомления", key="disable-notifications", use_container_width=True):
+            service.save_notification_settings(USER["id"], mail["recipient"], False)
+            mail = service.notification_settings(USER["id"])
+            st.success("Уведомления отключены.")
         if not mail["configured"]:
-            st.info("Почта отправителя ещё не подключена на сервере. Адрес можно сохранить сейчас; отправка начнётся после подключения.")
+            if mail["enabled"]:
+                st.info(f"Адрес сохранён. Отправка писем ещё не подключена в FixList. В очереди: {mail['pending']}.")
+            else:
+                st.info("Адрес можно сохранить сейчас. Письма будут ждать подключения отправки в FixList.")
         elif mail["enabled"]:
-            st.caption(f"В очереди: {mail['pending']} · отправлено: {mail['sent']} · не доставлено: {mail['failed']}")
+            st.caption(f"Почта подключена · в очереди: {mail['pending']} · принято почтовым сервисом: {mail['sent']} · ошибок: {mail['failed']}")
             if st.button("Отправить тестовое письмо", key="test-notification", use_container_width=True):
                 try:
                     service.test_notification(USER["id"])

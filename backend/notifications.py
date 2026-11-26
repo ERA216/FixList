@@ -1,4 +1,4 @@
-"""Уведомления по SMTP: настройки компании, надёжная очередь и фоновая отправка."""
+"""Настройки почты компании, очередь уведомлений и фоновая отправка."""
 import logging
 import re
 import smtplib
@@ -10,6 +10,8 @@ from email.headerregistry import Address
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 
+import requests
+
 from . import config, db
 from .schemas import event_type_label
 
@@ -20,8 +22,13 @@ _wake = threading.Event()
 MAX_ATTEMPTS = 5
 
 
+class MailDeliveryError(Exception):
+    """A mail service error with a message safe to display in FixList."""
+
+
 def configured() -> bool:
-    return bool(config.SMTP_HOST and config.SMTP_USER and config.SMTP_PASSWORD and config.SMTP_PORT in (465, 587))
+    return bool((config.RESEND_API_KEY and config.RESEND_FROM_EMAIL)
+                or (config.SMTP_HOST and config.SMTP_USER and config.SMTP_PASSWORD and config.SMTP_PORT in (465, 587)))
 
 
 def _admin(user_id: int) -> int:
@@ -150,7 +157,37 @@ def _claim():
     return None
 
 
+def _send_resend(item: dict) -> None:
+    response = requests.post(
+        "https://api.resend.com/emails",
+        headers={"Authorization": f"Bearer {config.RESEND_API_KEY}",
+                 "Idempotency-Key": item["message_id"].strip("<>")},
+        json={"from": config.RESEND_FROM_EMAIL, "to": [item["recipient"]],
+              "subject": item["subject"], "text": item["body"]},
+        timeout=10,
+        allow_redirects=False,
+    )
+    if response.status_code in (401, 403):
+        raise MailDeliveryError("Почтовый сервис отклонил отправку. Проверьте ключ и подтверждение адреса отправителя.")
+    if response.status_code == 429:
+        raise MailDeliveryError("Достигнут лимит отправки писем. FixList повторит попытку по расписанию.")
+    if response.status_code in (400, 422):
+        raise MailDeliveryError("Почтовый сервис отклонил письмо. Проверьте адрес получателя и настройки отправителя.")
+    if not 200 <= response.status_code < 300:
+        raise MailDeliveryError("Почтовый сервис временно не принял письмо.")
+    try:
+        result = response.json()
+    except ValueError:
+        result = None
+    if not isinstance(result, dict) or not result.get("id"):
+        raise MailDeliveryError("Почтовый сервис не подтвердил приём письма.")
+
+
 def _send_email(item: dict) -> None:
+    if config.RESEND_API_KEY and config.RESEND_FROM_EMAIL:
+        _send_resend(item)
+        return
+
     message = EmailMessage()
     message["From"] = str(Address("FixList", addr_spec=config.SMTP_USER))
     message["To"] = item["recipient"]
@@ -175,7 +212,7 @@ def _send_email(item: dict) -> None:
 
 
 def process_pending(limit: int = 10) -> int:
-    """Ограниченная порция очереди; ошибки SMTP не мешают сохранению заявок."""
+    """Ограниченная порция очереди. Ошибки отправки не мешают сохранению заявок."""
     if not configured():
         return 0
     delivered = 0
@@ -186,7 +223,9 @@ def process_pending(limit: int = 10) -> int:
         try:
             _send_email(item)
         except Exception as exc:
-            if isinstance(exc, smtplib.SMTPAuthenticationError):
+            if isinstance(exc, MailDeliveryError):
+                error = str(exc)
+            elif isinstance(exc, smtplib.SMTPAuthenticationError):
                 error = "Почтовый сервис отклонил вход отправителя."
             elif isinstance(exc, smtplib.SMTPRecipientsRefused):
                 error = "Почтовый сервис отклонил адрес получателя."
