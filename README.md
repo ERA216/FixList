@@ -170,7 +170,7 @@ flowchart LR
 
 ## 🚀 Быстрый старт
 
-Нужны **Python 3.11+** и **Git**. Запуск занимает пару минут.
+Нужны **Python 3.11+**, **Git** и ключ **Gemini API** — он создаётся за минуту в [Google AI Studio](https://aistudio.google.com/apikey). Запуск занимает пару минут.
 
 **macOS / Linux**
 
@@ -178,7 +178,7 @@ flowchart LR
 git clone https://github.com/ERA216/FixList.git
 cd FixList
 python3 -m pip install -r requirements.txt
-cp .env.example .env
+cp .env.example .env        # впишите в .env ключ: GEMINI_API_KEY=ваш_ключ
 python3 -m streamlit run app.py
 ```
 
@@ -188,7 +188,7 @@ python3 -m streamlit run app.py
 git clone https://github.com/ERA216/FixList.git
 cd FixList
 python -m pip install -r requirements.txt
-copy .env.example .env
+copy .env.example .env      # впишите в .env ключ: GEMINI_API_KEY=ваш_ключ
 python -m streamlit run app.py
 ```
 
@@ -202,8 +202,6 @@ python -m streamlit run app.py
 | --- | --- | --- | --- |
 | Руководитель | `FIXLIST` | `boss` | `1111` |
 | Сотрудник | `FIXLIST` | `master` | `2222` |
-
-> **Чтобы увидеть ИИ в работе**, впишите ключ Gemini в файл `.env` (строка `GEMINI_API_KEY=`) и перезапустите приложение. Ключ создаётся в [Google AI Studio](https://aistudio.google.com/apikey). Без ключа приложение тоже запускается: история, задачи и расчёты работают, а ассистент отвечает по данным журнала.
 
 Вернуть демо-данные в исходное состояние: остановите приложение (`Ctrl+C`) и выполните `python scripts/reset_db.py`.
 
