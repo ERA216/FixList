@@ -170,21 +170,42 @@ flowchart LR
 
 ## 🚀 Быстрый старт
 
-Нужен Python 3.11+.
+Нужны **Python 3.11+** и **Git**. Запуск занимает пару минут.
+
+**macOS / Linux**
 
 ```sh
-git clone https://github.com/ERA216/FixList.git && cd FixList
+git clone https://github.com/ERA216/FixList.git
+cd FixList
+python3 -m pip install -r requirements.txt
+cp .env.example .env
+python3 -m streamlit run app.py
+```
+
+**Windows (PowerShell или командная строка)**
+
+```powershell
+git clone https://github.com/ERA216/FixList.git
+cd FixList
 python -m pip install -r requirements.txt
-cp .env.example .env            # Windows: copy .env.example .env — и впишите GEMINI_API_KEY
+copy .env.example .env
 python -m streamlit run app.py
 ```
 
-Откроется `http://localhost:8501`. При первом запуске создаётся база с реальными событиями Kelmarsh.
+Если команда `python` не найдена, используйте `py` вместо `python`.
+
+После запуска откройте адрес из терминала — обычно **http://localhost:8501**. При первом запуске Streamlit может спросить email в терминале: просто нажмите **Enter**. База с реальными событиями Kelmarsh создаётся автоматически.
+
+**Вход в демо-кабинет**
 
 | Роль | Код компании | Логин | PIN |
 | --- | --- | --- | --- |
 | Руководитель | `FIXLIST` | `boss` | `1111` |
 | Сотрудник | `FIXLIST` | `master` | `2222` |
+
+> **Чтобы увидеть ИИ в работе**, впишите ключ Gemini в файл `.env` (строка `GEMINI_API_KEY=`) и перезапустите приложение. Ключ создаётся в [Google AI Studio](https://aistudio.google.com/apikey). Без ключа приложение тоже запускается: история, задачи и расчёты работают, а ассистент отвечает по данным журнала.
+
+Вернуть демо-данные в исходное состояние: остановите приложение (`Ctrl+C`) и выполните `python scripts/reset_db.py`.
 
 <details>
 <summary><b>Подключение Gemini</b></summary>
@@ -197,7 +218,7 @@ GEMINI_API_KEY=ваш_ключ
 LLM_MODEL=gemini-3.5-flash-lite
 ```
 
-Ключ храните только в `.env` или в закрытых переменных окружения хостинга — не добавляйте его в GitHub. Проверка подключения: `python scripts/check_gemini.py`. [Как получить ключ Gemini](https://ai.google.dev/gemini-api/docs/api-key).
+Ключ храните только в `.env` или в закрытых переменных окружения хостинга (например, Secrets в Streamlit Community Cloud) — не добавляйте его в GitHub. Проверка подключения: `python scripts/check_gemini.py` — команда отправляет один короткий запрос и сообщает, работает ли ключ. [Как получить ключ Gemini](https://ai.google.dev/gemini-api/docs/api-key).
 
 </details>
 
